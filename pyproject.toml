@@ -1,0 +1,15 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["services", "libs", "scripts", "ml"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = ["libs/events/src", "libs/observability/src"]

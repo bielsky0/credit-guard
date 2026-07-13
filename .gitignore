@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+
+# Env / secrets
+.env
+.env.*.local
+
+# ML artifacts (large / regenerable — model.joblib is versioned intentionally per §7.3, keep it)
+ml/data/
+
+# Docker / infra data
+infra/**/data/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

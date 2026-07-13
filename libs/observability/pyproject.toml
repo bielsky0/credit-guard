@@ -1,0 +1,13 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "crediguard-observability"
+version = "0.1.0"
+description = "Shared structured logging (structlog) and correlation-ID propagation for CrediGuard services."
+requires-python = ">=3.12"
+dependencies = ["structlog>=24.1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/crediguard_observability"]

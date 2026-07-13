@@ -1,0 +1,121 @@
+name: crediguard-infra
+
+networks:
+  crediguard-infra:
+    name: crediguard-infra
+
+volumes:
+  postgres_data:
+  minio_data:
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: crediguard-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-postgres}
+      APPLICANT_DB_NAME: ${APPLICANT_DB_NAME:-applicant_db}
+      APPLICANT_DB_USER: ${APPLICANT_DB_USER:-applicant_svc}
+      APPLICANT_DB_PASSWORD: ${APPLICANT_DB_PASSWORD:-applicant_dev_pw}
+      LOAN_DB_NAME: ${LOAN_DB_NAME:-loan_db}
+      LOAN_DB_USER: ${LOAN_DB_USER:-loan_svc}
+      LOAN_DB_PASSWORD: ${LOAN_DB_PASSWORD:-loan_dev_pw}
+      DOCUMENT_DB_NAME: ${DOCUMENT_DB_NAME:-document_db}
+      DOCUMENT_DB_USER: ${DOCUMENT_DB_USER:-document_svc}
+      DOCUMENT_DB_PASSWORD: ${DOCUMENT_DB_PASSWORD:-document_dev_pw}
+      UNDERWRITING_DB_NAME: ${UNDERWRITING_DB_NAME:-underwriting_db}
+      UNDERWRITING_DB_USER: ${UNDERWRITING_DB_USER:-underwriting_svc}
+      UNDERWRITING_DB_PASSWORD: ${UNDERWRITING_DB_PASSWORD:-underwriting_dev_pw}
+      DISBURSEMENT_DB_NAME: ${DISBURSEMENT_DB_NAME:-disbursement_db}
+      DISBURSEMENT_DB_USER: ${DISBURSEMENT_DB_USER:-disbursement_svc}
+      DISBURSEMENT_DB_PASSWORD: ${DISBURSEMENT_DB_PASSWORD:-disbursement_dev_pw}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - crediguard-infra
+
+  redis:
+    image: redis:7-alpine
+    container_name: crediguard-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - crediguard-infra
+
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: crediguard-kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CLUSTER_ID: ${KAFKA_CLUSTER_ID:-MkU3OEVBNTcwNTJENDM2Qg}
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:${KAFKA_HOST_PORT:-9094}
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    ports:
+      - "${KAFKA_HOST_PORT:-9094}:9094"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+    networks:
+      - crediguard-infra
+
+  minio:
+    image: minio/minio:latest
+    container_name: crediguard-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin_dev_pw}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - crediguard-infra
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    container_name: crediguard-jaeger
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "${JAEGER_UI_PORT:-16686}:16686"
+      - "${JAEGER_OTLP_GRPC_PORT:-4319}:4317"
+      - "${JAEGER_OTLP_HTTP_PORT:-4320}:4318"
+    networks:
+      - crediguard-infra
