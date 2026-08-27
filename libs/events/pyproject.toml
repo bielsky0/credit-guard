@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "crediguard-events"
 version = "0.1.0"
 description = "Shared Kafka event envelope and contracts for CrediGuard services."
-requires-python = ">=3.12"
+requires-python = ">=3.9"
 dependencies = ["pydantic>=2.7"]
 
 [tool.hatch.build.targets.wheel]
