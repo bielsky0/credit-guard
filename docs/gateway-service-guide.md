@@ -64,6 +64,39 @@ Gateway Service jest **bezstanowy (stateless)** — z definicji **nie posiada w�
 | `/api/v1/loans/{id}/events` | (SSE) | **nie proxy** (Etap 4) | ✅ JWT | ❌ |
 | `/api/v1/webhooks/stripe` | POST | `loan-application:8002` | ❌ publiczny (webhook) | ❌ |
 
+> **Uwaga do tabeli (po weryfikacji kodu, §11 G-1/G-2):** wiersze z literalnym `{id}` (`/loans/{id}`, `/documents`, `/events`) w praktyce **nie matchują** (niedostępne routingowo), a bez naprawy G-1 cała tabela zwraca 404. Tabela opisuje **intencję** (`routing.py`), nie działanie. Trzymaj ją zsynchronizowaną z testem integracyjnym z §9.5 (gdy powstanie).
+
+#### Przykład: co gateway robi z requestem (ślad nagłówków)
+
+Wejście (klient → `:8000`, próba spoofingu w cenie):
+
+```http
+POST /api/v1/loans HTTP/1.1
+Authorization: Bearer eyJhbGciOiJSUzI1NiJ9...
+X-User-ID: admin-uuid              ← podróbka (gateway wyrzuci!)
+X-User-Roles: admin                ← podróbka (gateway wyrzuci!)
+Content-Type: application/json
+Idempotency-Key: 7c9e6679-...
+
+{"amount": 15000, "term_months": 24, "monthly_income": 6000, "applicant_age": 30}
+```
+
+Wyjście (gateway → `loan-application:8002`, po JWT + rate limit):
+
+```http
+POST /api/v1/loans HTTP/1.1
+X-User-ID: 550e8400-...            ← prawdziwy (z sub tokena!)
+X-User-Roles: applicant            ← default (nie admin!)
+X-Correlation-ID: 9f8e7d6c-...     ← propagowany lub świeży
+Content-Type: application/json
+Idempotency-Key: 7c9e6679-...      ← passthrough (gateway nie rusza!)
+
+{"amount": 15000, ...}             ← body bajt-w-bajt (bez parsowania!)
+```
+
+- Zniknęło: `Authorization` (wewnętrzny serwis go nie potrzebuje), podróbki tożsamości. Zostało: biznes (`Content-Type`, `Idempotency-Key`, query, body). Doszło: zaufana tożsamość + korelacja. To jest cała „logika" gateway w jednym przykładzie.
+- Odpowiedź wraca strumieniem (`StreamingResponse`, status transparentny — 202 z loan-app = 202 do klienta, patrz poprawiony diagram §12.1.3) + `X-Correlation-ID` doklejone (klient dostaje nić do supportu).
+
 ### 1.3 Dlaczego ten serwis jest ważny?
 
 1. **Jedyny punkt wejścia** — bez niego klient nie ma jak dotrzeć do żadnego wewnętrznego serwisu. To pojedyncza, kontrolowana powierzchnia ataku.
@@ -410,7 +443,7 @@ from redis.asyncio import Redis
 ```
 
 - **`import time`** — dostep do `time.time()` — zwraca aktualny czas jako float (sekundy od 1970-01-01, Unix timestamp z ułamkami milisekund).
-- **`from typing import Protocol`** — Python 3.8+ (standard library). `Protocol` pozwala definiować **structural subtyping** (duck typing z adnotacjami) — klasa `SlidingWindowRateLimiter` nie musi显式 dziedziczyć po `RateLimiter`, by móc być użytą w miejscu oczekującym tego typu.
+- **`from typing import Protocol`** — Python 3.8+ (standard library). `Protocol` pozwala definiować **structural subtyping** (duck typing z adnotacjami) — klasa `SlidingWindowRateLimiter` nie musi jawnie (explicit) dziedziczyć po `RateLimiter`, by móc być użytą w miejscu oczekującym tego typu.
 
 #### Blok 2: protokół `RateLimiter`
 
@@ -421,7 +454,7 @@ class RateLimiter(Protocol):
         ...
 ```
 
-- **`Protocol`** — interfejs (kontrakt): cokolwiek, co ma `async def allowed(key, limit, window) -> bool`, jest typem `RateLimiter`. Dlaczego Protocol zamiast `ABC`? Bo nie wymaga显式 `@abstractmethod` i nie wymaga dziedziczenia — duck typing z type-checkingiem. Upraszcza testy (FakeRedis, FakeRedisLimiter nie muszą显式 implementować `RateLimiter`).
+- **`Protocol`** — interfejs (kontrakt): cokolwiek, co ma `async def allowed(key, limit, window) -> bool`, jest typem `RateLimiter`. Dlaczego Protocol zamiast `ABC`? Bo nie wymaga jawnego `@abstractmethod` i nie wymaga dziedziczenia — duck typing z type-checkingiem. Upraszcza testy (FakeRedis, FakeRedisLimiter nie muszą jawnie implementować `RateLimiter`).
 - **`...` w ciele** — "placeholder" dla metody abstrakcyjnej (nie implemented). Podobnie do `@abstractmethod`.
 
 #### Blok 3: `SlidingWindowRateLimiter`
@@ -480,7 +513,7 @@ Krok po kroku:
 
 **Dlaczego nie Lua Script?** Redis pozwala na skrypty Lua (np. do operacji atomowych), ale pipeline transakcyjny (MULTI/EXEC) jest równie atomowy i prostszy w utrzymaniu. Lua jest potrzebna, gdy trzeba podejmować decyzje warunkowe wewnątrz Redis; tu decyzja (`count < limit`) jest podejmowana po stronie Pythona.
 
-**Dlaczego Sorted Set, a nie普通的计数器 (INCR)?** Bo Sorted Set pozwala na **sliding window** — dowolny moment czasu jako "kreska" okna. Zwykły `INCR` z `EXPIRE` daje "fixed window" (okno resetuje się po upływie TTL), co jest mniej sprawiedliwe (ruch o północy okna może podwoić liczbę żądań).
+**Dlaczego Sorted Set, a nie zwykłego licznika (INCR)?** Bo Sorted Set pozwala na **sliding window** — dowolny moment czasu jako "kreska" okna. Zwykły `INCR` z `EXPIRE` daje "fixed window" (okno resetuje się po upływie TTL), co jest mniej sprawiedliwe (ruch o północy okna może podwoić liczbę żądań).
 
 ---
 
@@ -566,7 +599,7 @@ class TokenValidator:
   - `authorization is None` — nagłówek nie istnieje (klient nie jest zalogowany).
   - `not authorization.startswith("Bearer ")` — nagłówek istnieje, ale nie zaczyna się od `Bearer ` (zły schemat autoryzacji, np. `Token xyz` lub `Basic ...`).
 - **`Bearer ` (z spacją!)** — standard OAuth 2.0: `Authorization: Bearer <token>`. Spacja po "Bearer" jest częścią prefiksu.
-- **Wyrzucenie `InvalidTokenError` zamiast `HTTPException`** —罕例: wyjątkiem serwisowym, nie HTTP. Mapowanie na HTTP odbywa się w `proxy_router.py` (sek. 4.8). Pozwala to testować `TokenValidator` niezależnie od FastAPI.
+- **Wyrzucenie `InvalidTokenError` zamiast `HTTPException`** — celowo: wyjątkiem serwisowym, nie HTTP. Mapowanie na HTTP odbywa się w `proxy_router.py` (sek. 4.8). Pozwala to testować `TokenValidator` niezależnie od FastAPI.
 
 ```python
         token = authorization[7:]
@@ -588,7 +621,7 @@ class TokenValidator:
 - **`jwt.decode(token, self._public_key, algorithms=["RS256"])`** — odczytanie payloadu tokena i weryfikacja:
   - **Weryfikacja podpisu** kluczem publicznym (RS256): jeśli podpis nie pasuje → `JWTError`.
   - **Weryfikacja `exp` (expiry)**: jeśli token wygasł → `JWTError` (o ile nie podano `options={"verify_exp": False}`).
-  - **`algorithms=[ALGORITHM]`** — **biała lista algorytmów**. KRYTYCZNE dla bezpieczeństwa: zapobiega atakowi "algorithm confusion", gdy atakujący próbuje podać `HS256` (symetryczny) zamiast `RS256` i podpisać token公共nym kluczem jako sekretem. Biała lista wymusza, by token był podpisany dokładnie RS256.
+  - **`algorithms=[ALGORITHM]`** — **biała lista algorytmów**. KRYTYCZNE dla bezpieczeństwa: zapobiega atakowi "algorithm confusion", gdy atakujący próbuje podać `HS256` (symetryczny) zamiast `RS256` i podpisać token publicznym kluczem jako sekretem. Biała lista wymusza, by token był podpisany dokładnie RS256.
 
 ```python
             if payload.get("type") != "access":
@@ -616,7 +649,7 @@ def build_token_validator(settings: Settings) -> TokenValidator:
     return TokenValidator(settings.jwt_public_key)
 ```
 
-- **Factory pattern:** tworzy `TokenValidator` z `Settings`. Nie używana obecnie (w `init_gateway` tworzymy wprost `TokenValidator(settings.jwt_public_key)`), ale istnieje jako便捷 helper. Alternatywnie mogłaby być użyta w przyszłości, np. do lazy loadingu klucza.
+- **Factory pattern:** tworzy `TokenValidator` z `Settings`. Nie używana obecnie (w `init_gateway` tworzymy wprost `TokenValidator(settings.jwt_public_key)`), ale istnieje jako wygodny (convenience) helper. Alternatywnie mogłaby być użyta w przyszłości, np. do lazy loadingu klucza.
 
 ---
 
@@ -652,7 +685,7 @@ class Route:
 
 - **`@dataclass(frozen=True)`** — `frozen=True` oznacza, że obiekt jest **niemutowalny** (nie można zmienić jego pól po utworzeniu). W Pythonie 3.10+ jest to ekwiwalent `@dataclass(frozen=True)`, ale w 3.9+ trzeba dodać `frozen=True` ręcznie. Niemutowalność jest tu kluczowa: tablica tras jest budowana RAZ przy starcie (`build_routes`) i nigdy nie powinna się zmieniać. `frozen=True` chroni przed przypadkową mutacją (np. `route.base_url = "..."` rzuci `FrozenInstanceError`).
 
-- **`path_prefix: str`** — prefiks ścieżki (np. `/api/v1/auth/register`). Długość prefiksu decyduje o优先级 w matchowaniu (longest prefix match).
+- **`path_prefix: str`** — prefiks ścieżki (np. `/api/v1/auth/register`). Długość prefiksu decyduje o priorytecie w matchowaniu (longest prefix match).
 
 - **`base_url: str`** — docelowy URL serwisu (np. `http://applicant:8001`). Pusta string `""` oznacza "nie proxy" (obsługa lokalna, np. SSE w Etap 4).
 
@@ -668,7 +701,7 @@ class Route:
 
 - **`rate_limit_count: int = 0`** — maksymalna liczba żądań w oknie. `5` (auth) lub `3` (loans).
 
-**Dlaczego `frozen=True`, a nie `NamedTuple`?** `NamedTuple` jest też niemutowalny, ale nie pozwala na wartości domyślne `None` dla pól bez powtarzania się w konstruktorze; ponadto `frozen dataclass` jest bardziej elastyczny i czytelny. `frozen=True` jest lepsze niż普通的 `@dataclass` bo jawnie komunikuje "ten obiekt nie powinien się zmieniać".
+**Dlaczego `frozen=True`, a nie `NamedTuple`?** `NamedTuple` jest też niemutowalny, ale nie pozwala na wartości domyślne `None` dla pól bez powtarzania się w konstruktorze; ponadto `frozen dataclass` jest bardziej elastyczny i czytelny. `frozen=True` jest lepsze niż zwykły `@dataclass` bo jawnie komunikuje "ten obiekt nie powinien się zmieniać".
 
 ---
 
@@ -868,14 +901,14 @@ _DEFAULT_ROLES = "applicant"
 - `x-user-id` — tożsamość użytkownika. Klient MOGŁBY spreparować fałszywy nagłówek `X-User-ID: admin-uuid` — wewnętrzny serwis mógłby mu zaufać (bo normalnie gateway go wstrzykuje). Dlatego **zawsze usuwamy** go z żądania klienta i wstrzykujemy własny po weryfikacji JWT.
 - `x-user-roles` — role. Analogicznie — klient nie powinien deklarować swoich ról.
 - `authorization` — oryginalny token JWT. Klient nie musi go przekazywać do wewnętrznych serwisów (token nie jest im potrzebny; tożsamość jest w `X-User-ID`).
-- `x-correlation-id` — **nie jest usuwany przez `_STRIPPED_HEADERS` w _rewrite_headers** — wait, uwaga: `x-correlation-id` jest w `_STRIPPED_HEADERS`, ale w `_rewrite_headers` jest dodawany jawnie na końcu (`out.append((b"X-Correlation-ID", correlation_id.encode()))`). To oznacza: oryginalny nagłówek klienta jest usuwany, a zastępowany naszą wartością (lub UUID). Klient NIE może narzucić własnego `correlation_id` — gateway zawsze nadpisuje (choć迭zka `proxy_router` propaguje client-provided correlation ID: `correlation_id = client_headers.get("x-correlation-id") or str(uuid4())`).
+- `x-correlation-id` — nagłówek jest w `_STRIPPED_HEADERS` (oryginał klienta nie przechodzi wprost), ale `proxy_router` odczytuje go wcześniej (`correlation_id = client_headers.get("x-correlation-id") or str(uuid4())` — §4.8) i `_rewrite_headers` wstrzykuje tę wartość z powrotem jako pojedynczy, kanoniczny `X-Correlation-ID`. Efekt: ID klienta jest **propagowane** (nie losowane na nowo), ale znormalizowane (bez duplikatów). Klient może narzucić własny correlation ID — to celowe (frontendowy trace!), nie dziura (ID nie niesie uprawnień).
 
 **`_BLOCKED_HEADERS` — nagłówki blokowane ze względów technicznych i bezpieczeństwa:**
 - `host` — nagłówek HostHTTP/1.1. Klient mógłby ustawić `Host: evil.com`, co mogłoby wpłynąć na routing w serwisie docelowym (choć w praktyce httpx nadpisuje go na podstawie URL).
 - `content-length` — httpx przelicza go automatycznie (bo body jest strumieniowane; rozmiar może się zmieniać). Przekazanie starego `Content-Length` mogłoby spowodować błędy parsowania.
 - `connection`, `transfer-encoding`, `upgrade` — **nagłówki hop-by-hop** (RFC 2616 §13.5.1): powinny być usuwane przy przekazywaniu. `Connection: keep-alive` między klientem a gateway nie powinno być przekazywane do serwisu docelowego (każde połączenie jest osobne).
 
-**`_DEFAULT_ROLES = "applicant"`** — stała. Domyślna rola: `applicant` (wnioskodawca). Gateway nie rozróżnia ról (nie ma mechanizmu RBAC);植入默认owa rola jest dla spójności i przyszłego rozszerzenia.
+**`_DEFAULT_ROLES = "applicant"`** — stała. Domyślna rola: `applicant` (wnioskodawca). Gateway nie rozróżnia ról (nie ma mechanizmu RBAC); wstrzykiwana domyślna rola jest dla spójności kontraktu z serwisami wewnętrznymi i przyszłego rozszerzenia (gdy pojawi się RBAC).
 
 #### Blok 3: `ProxyService`
 
@@ -1157,7 +1190,7 @@ async def proxy_endpoint(path: str, request: Request) -> Response:
     client_headers = dict(request.headers.items())
 ```
 
-- **Kopiowanie nagłówków** do普通的 `dict`. ASGI przekazuje nagłówki jako listę krotek; `dict(...)` konwertuje je na słownik (łatwiesza manipulacja). `request.headers` jest "read-only view" — kopiowanie jest bezpieczne.
+- **Kopiowanie nagłówków** do zwykłego `dict`. ASGI przekazuje nagłówki jako listę krotek; `dict(...)` konwertuje je na słownik (łatwiesza manipulacja). `request.headers` jest "read-only view" — kopiowanie jest bezpieczne.
 
 ```python
     # JWT auth where required.
@@ -1246,7 +1279,7 @@ async def proxy_endpoint(path: str, request: Request) -> Response:
     )
 ```
 
-- **`StreamingResponse`** — FastAPI/Starlette strumieniuje body iteratora do klienta. Nie buforuje —第一次yield result status i headers, potem strumieniuje chunki. Pozwala naobsłużyć odpowiedzi dowolnej wielkości (MB/GB) bez użycia pamięci.
+- **`StreamingResponse`** — FastAPI/Starlette strumieniuje body iteratora do klienta. Nie buforuje — najpierw wysyła status i nagłówki, potem strumieniuje chunki w miarę napływania z serwisu wewnętrznego. Pozwala obsłużyć odpowiedzi dowolnej wielkości (MB/GB) bez zużycia pamięci.
 
 ---
 
@@ -1639,7 +1672,7 @@ allowed = await _limiter.allowed("loans:550e8400-...", 3, 600)
 
 ### 5.4 Scenariusze błędów
 
-#### 5.4.1 Nieznana ścieżka → 404
+#### 5.4.1 Nieznana ścieżka → 404 (poprawny wynik, zła przyczyna!)
 
 ```bash
 curl http://localhost:8000/api/v1/unknown
@@ -1647,15 +1680,18 @@ curl http://localhost:8000/api/v1/unknown
 
 - `_match_route("api/v1/unknown")` → brak kandydatów → `None`.
 - Zwraca `JSONResponse({"detail": "Not Found"}, status_code=404)`.
+- **Uwaga (luka G-1, §11):** 404 jest tu poprawne, ale przyczyna opisana wyżej myli — matchowanie nie działa dla **żadnej** ścieżki (brak wiodącego `/` po stronie Starlette), więc ten sam 404 dostaje też poprawny `/api/v1/auth/register`. Test „nieznana ścieżka → 404" przechodzi z fałszywego powodu (false positive!).
 
-#### 5.4.2 SSE endpoint (niezaimplementowany) → 404
+#### 5.4.2 SSE endpoint (niezaimplementowany) → 404 (dwoma różnymi drogami)
 
 ```bash
 curl http://localhost:8000/api/v1/loans/123/events \
   -H "Authorization: Bearer eyJhbGci..."
 ```
 
-- `_match_route("api/v1/loans/123/events")` → kandydat: `/api/v1/loans/{id}/events` → match (startsWith + == check). Ale `route.base_url == ""` → zwraca 404 (jak "Not Found"). W przyszłości (Etap 4) zostanie tu zaimplementowane SSE.
+- **Droga 1 (realna, przez Starlette):** catch-all `/{path:path}` daje `path = "api/v1/loans/123/events"` (BEZ wiodącego `/`!). `_match_route` porównuje z prefixami ZE slashem → brak kandydatów → `None` → 404 (luka krytyczna G-1, §11).
+- **Droga 2 (hipotetyczna, gdyby slash był):** nawet z wiodącym `/` kandydatem byłby `/api/v1/loans` (prefix + `/` pasuje!), a NIE literalny `/api/v1/loans/{id}/events` (ten string nie występuje w realnych ścieżkach — §11 luka `path_prefix` z `{id}`). Gałąź `route.base_url == ""` (SSE stub) jest więc **nieosiągalna** — request poszedłby proxy do `loan-application:8002` zamiast 404!
+- Wniosek: stub SSE nie działa ani jako 404 (realnie: 404, ale z powodu G-1, nie stubu), ani jako przyszły punkt zaczepienia (niedostępny routing). Etap 4 musi naprawić oba poziomy. W przyszłości (Etap 4) zostanie tu zaimplementowane SSE.
 
 #### 5.4.3 Brak autoryzacji → 401
 
@@ -1681,6 +1717,22 @@ curl http://localhost:8000/api/v1/me
 
 - Żądanie przed `init_gateway()` (np.Race condition przy starcie).
 - `503 Service Unavailable`.
+
+### 5.5 Tabela kodów — kto, kiedy, co zwraca
+
+| Kod | Kto generuje | Kiedy | Treść | Retry klienta? |
+|-----|--------------|-------|-------|----------------|
+| 200/201/202 | serwis wewnętrzny (passthrough!) | sukces upstream | body serwisu | nie (sukces) |
+| 400 | gateway (`Rate limit not applicable`) | route loans bez `applicant_id` (praktycznie niemożliwe — wymaga auth) | `{"detail": ...}` | nie (bug/config) |
+| 401 | gateway (JWT) | brak/zły/wygasły token, refresh zamiast access | `{"detail": "Unauthorized"}` + `WWW-Authenticate: Bearer` | tak — po odświeżeniu tokena |
+| 404 | gateway (routing) | brak route / stub SSE... **oraz każdy request przy luce G-1!** | `{"detail": "Not Found"}` | nie (ale przy G-1: czekaj na fix, nie na siebie) |
+| 405 | Starlette | OPTIONS / nieobsługiwana metoda (preflight CORS!) | generyczne | nie (luka G-3) |
+| 422 | serwis wewnętrzny (passthrough) | zły JSON (Pydantic w serwisie) | `{"detail": [...]}` | tak — po poprawie body |
+| 429 | gateway (limiter) | >5/min/IP (auth) lub >3/10min/user (loans) | `{"detail": "Rate limit exceeded"}` (bez `Retry-After`!) | tak — po oknie (60 s / 600 s) |
+| 500 | FastAPI (nieobsłużony wyjątek) | timeout upstream (G-4!), błąd serwisu, bug | generyczne | tak — z backoff (ostrożnie: 500 po timeout mogło wykonać operację!) |
+| 503 | gateway (strażnik) | request przed `init_gateway` | `{"detail": "Gateway not ready"}` | tak — za chwilę (startup) |
+
+- Kluczowa własność: gateway **nie mapuje** statusów upstream (404 serwisu = 404 klienta). Mapuje tylko własne decyzje (401/404-routing/429/503). Wyjątek: błąd sieci upstream → 500 (G-4 — powinno być 502/503/504!).
 
 ---
 
@@ -1800,6 +1852,78 @@ Gateway usuwa hop-by-hop (`Connection`, `Transfer-Encoding`, `Host`) i dodatkowe
 - `Transfer-Encoding: chunked` jest relewantne między gateway a internal service (nie między klientem a gateway).
 - `Content-Length` jest przeliczane automatycznie przez httpx/Starlette dla `StreamingResponse`.
 - `Host` mógłby wpłynąć na routing w internal services.
+
+### 6.7 `httpx.AsyncClient` + connection pooling — jedna pula na proces
+
+`ProxyService.__init__` tworzy **jeden** `httpx.AsyncClient(timeout=30.0)` na cały proces (singleton modułowy przez `init_gateway`). Dlaczego nie nowy klient per request?
+
+- **Pooling połączeń:** klient trzyma otwarte keep-alive TCP do `applicant:8001`, `loan-application:8002`, `document:8003`. Nowy request reuse'uje socket (bez handshake TCP + bez negocjacji HTTP/1.1 od zera — ~1–5 ms oszczędności na zimnym połączeniu). Przy 100 RPS to różnica między „płynnie" a „TIME_WAIT wszędzie".
+- **`timeout=30.0`:** całkowity deadline requestu (connect + write + read). Wewnętrzny serwis wolniejszy niż 30 s → `httpx.TimeoutException` → 500 (nie wiszący request w nieskończoność!). 30 s to dużo jak na API (loan-app odpowiada w ms) — ustawione z zapasem na zimny start / GC / spike. Alternatywa: granularne timeouty (`httpx.Timeout(connect=2, read=10, ...)`) — precyzyjniejsze (odróżnia „serwis nieosiągalny" od „serwis wolny"), dziś nieużywane.
+- **`aclose()` w `close_gateway`:** zwrot socketów przy shutdown (bez tego: warningi `Unclosed client`, wiszące FD do SIGKILL).
+- **Pułapka testowa:** `ProxyService()` w testach nagłówków tworzy klienta (nieużywanego — §9.3). Konstruktor miesza dwie odpowiedzialności (klient HTTP + przepisywanie nagłówków) — `_rewrite_headers` jako `@staticmethod` lub osobna funkcja usunęłaby potrzebę klienta w testach.
+
+### 6.8 `StreamingResponse` — odpowiedź bez bufora
+
+Gateway **nigdy nie trzyma całej odpowiedzi w pamięci**: `forward()` zwraca `body_iterator` (async generator nad `resp.aiter_bytes()`), a `proxy_endpoint` owija go w Starlette `StreamingResponse`. Dla laika: zwykła odpowiedź to „najpierw cała paczka, potem wysyłka" (bufor = rozmiar odpowiedzi w RAM); streaming to „czytam kawałek → wysyłam kawałek" (bufor = jeden chunk ~4 KB).
+
+- **`stream=True` w `client.send`:** httpx nie pobiera body od razu (tylko status + nagłówki); treść płynie przez `aiter_bytes()` na żądanie iteratora. Bez `stream=True` cały body lądowałby w pamięci gateway (upload 100 MB przez gateway = 100 MB RAM na request!).
+- **`body_stream()` z `try/finally`:** generator zamyka odpowiedź upstream (`await resp.aclose()` — zwrot socketu do puli!) także przy przerwaniu przez klienta (rozłączenie w połowie pobierania). Bez `finally`: zerwane pobieranie = wyciek połączenia z puli (pool wyczerpany po N zerwaniach — DoS przez zamykanie kart!).
+- **Filtrowanie nagłówków odpowiedzi** (`transfer-encoding`, `connection`, `content-length` — §4.8): `StreamingResponse` liczy `Content-Length` sam (albo używa chunked); przepuszczenie upstreamowego `Content-Length` dałoby mismatch (gateway strumieniuje, długość inna niż deklarowana → klient ucina/wiesza się).
+- **Status transparentny:** `status_code=result["status_code"]` — gateway nie mapuje (404 z serwisu = 404 do klienta; 500 = 500). Brama jest przezroczysta dla semantyki, nieprzezroczysta dla tożsamości.
+
+### 6.9 Correlation ID end-to-end — nić Ariadny
+
+```python
+correlation_id = client_headers.get("x-correlation-id") or str(uuid4())
+```
+
+- **Propaguj albo generuj:** frontend (lub test) może nadać `X-Correlation-ID` (własny trace!), gateway przejmuje; inaczej losowy UUIDv4. ID płynie dalej: wstrzyknięte do upstream (`X-Correlation-ID` w `_rewrite_headers` — §4.7) + zwrócone klientowi w odpowiedzi (debug: „zgłoś ten ID do supportu").
+- **Asymetria ze SPEC:** gateway propaguje **klientowy** ID (nie generuje zawsze własnego) — dobre dla frontendu (jeden ID od kliknięcia), ryzykowne przy kolizjach (klient śle stały `"123"` we wszystkim — korelacja rozmyta; akceptowane w MVP). Loan-app worker i tak gubi nić (świeży UUID w kopercie — luka w loan-app guide §11!).
+- **`x-correlation-id` w `_STRIPPED_HEADERS`:** klientowy nagłówek jest **usuwany** z forwardowanych i **wstrzykiwany** z powrotem jako pojedynczy, kanoniczny (bez duplikatów! — dwa `X-Correlation-ID` w upstream to rozjazd). Normalizacja, nie tylko passthrough.
+- **Middleware `CorrelationIdMiddleware`** (z `libs/observability`, wpięty w `main.py`): dokleja ID do logów structlog (każdy wpis gateway ma pole korelacji — `docker compose logs | grep <id>` pokazuje pełną historię requestu). Dwie warstwy: middleware (logi) + proxy_endpoint (propagacja) — razem pełny ślad.
+
+### 6.10 Catch-all `/{path:path}` — jeden endpoint na wszystko
+
+```python
+@router.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"], include_in_schema=False)
+async def proxy_endpoint(path: str, request: Request) -> Response:
+```
+
+- **`{path:path}` (konwerter `path`):** przechwytuje wszystko łącznie ze slashami (`api/v1/loans/123/documents` jako jedna zmienna). Zwykły `{path}` (konwerter `str`) zatrzymałby się na pierwszym `/`. Dla laika: `:path` to „weź resztę URL, nieważne jak długą".
+- **`path` BEZ wiodącego `/`** (Starlette obcina: request `/api/v1/x` → `path="api/v1/x"`) — a `_match_route` porównuje z prefixami **ZE** slashem (`/api/v1/x`)! Stąd luka krytyczna G-1 (§11): realne requesty nigdy nie matchują (zweryfikowane empirycznie — §11). Catch-all łapie, matcher gubi.
+- **Brak `OPTIONS`** w `methods` (GET/POST/PUT/PATCH/DELETE tylko): preflight CORS przeglądarki (OPTIONS) dostaje 405 (do tego brak `CORSMiddleware` — §11 luka G-3: frontend z przeglądarki nie zadzwoni wcale!).
+- **`include_in_schema=False`:** catch-all poza OpenAPI (Swagger pokazałby jeden endpoint `/{path}` zamiast prawdziwych — mylące; prawdziwe ścieżki dokumentują wewnętrzne serwisy, nie brama).
+- **Surowy `Request`, nie modele Pydantic:** gateway nie parsuje body (nie zna schematów wniosków — passthrough!). `request.stream()` (async iterator bajtów) leci do httpx jako `content` (zero buforowania, zero walidacji — brama nie zagląda do koperty).
+- **`request.scope.get("query_string", b"")` + ręczne `copy_with(query=...)`:** query przekazywane bajt-w-bajt (bez re-enkodowania httpx — polskie znaki, `+`, `%2F` docierają nietknięte). `params=None` w `build_request` (żadnego „mądrego" parsowania — przezroczystość).
+
+### 6.11 `frozenset` i `Mapping` — typy dla bezpieczeństwa i elastyczności
+
+```python
+_STRIPPED_HEADERS = frozenset({"x-user-id", "x-user-roles", "authorization", "x-correlation-id"})
+_BLOCKED_HEADERS = frozenset({"host", "content-length", "connection", "transfer-encoding", "upgrade"})
+```
+
+- **`frozenset` (nie `set`, nie `list`):** niemutowalny zbiór stałych bezpieczeństwa. `set` pozwalałby `add` w runtime (ktoś „tymczasowo" dodaje wyjątek i zapomina — dziura); `list` dawałaby `in` w O(n) + mutowalność. `frozenset` mówi: „te zbiory są kompletne od importu, próba zmiany to `AttributeError`". Test przynależności O(1) (jak `VALID_TRANSITIONS` w loan-app — ten sam idiom w obu serwisach!).
+- **Małe litery w zestawach + `lk = k.lower()`:** porównanie case-insensitive (HTTP/1.1 nagłówki case-insensitive! `X-User-ID`, `x-user-id`, `X-USER-ID` to to samo). Bez lowerowania atakujący ominąłby strip (`x-uSeR-iD` przeszłoby!). Testy wołają wielkoliterowe warianty — case-insensitivity implementacji niepokryta testem (luka w §9.3!).
+- **`Mapping[str, str]` (nie `dict`):** abstrakcja „coś słownikopodobnego" (protokoł `__getitem__`/`__iter__`/`__len__`). `_rewrite_headers` przyjmuje `dict` z endpointu i każdy inny mapping w teście (elastyczność bez kosztów). Z `collections.abc` (stdlib), nie `typing` (nowocześnie).
+
+### 6.12 Modułowe singletony zamiast `Depends()` — kompozycja bez frameworka
+
+```python
+_routes: list[Route] = []
+_proxy: ProxyService | None = None
+_validator: TokenValidator | None = None
+_limiter: SlidingWindowRateLimiter | None = None
+
+def init_gateway(settings: Settings, redis: Redis) -> None:
+    global _routes, _proxy, _validator, _limiter
+    ...
+```
+
+- **Dlaczego nie `Depends` jak w loan-app?** Bo gateway nie ma use case'ów do komponowania per request (4 obiekty na proces: trasy, klient HTTP, walidator, limiter — wszystkie bezstanowe/współdzielone). `Depends` per request budowałby fabryki dla czegoś, co istnieje raz. Singletony modułowe (import raz = jedna instancja) + `init_gateway` w lifespan (jawne okablowanie) = prostsze i szybsze (zero narzutu DI na request).
+- **Cena:** testowalność (testy muszą wołać `init_gateway` albo grzebać w globalach — unit testy omijają problem, testując klasy wprost, nie endpoint!). Endpoint testowany przez TestClient wymagałby `init_gateway` z prawdziwym Redisem albo monkeypatch globali (nieeleganckie — dlatego integracji nie ma; błędne koło: architektura zniechęca do testów, brak testów ukrywa bugi jak G-1!).
+- **`_limiter` pominięte w `close_gateway`** (zamyka tylko `_proxy` — limiter nie trzyma zasobów (Redis zamyka `close_redis` osobno), więc poprawne; ale asymetria `init` (4 obiekty) vs `close` (1 obiekt) myli czytelnika — komentarz by pomógł).
+- **Strażnik 503** (`if _proxy is None or _validator is None` — §4.8): request przed `init_gateway` (restart w locie) dostaje czytelną odpowiedź, nie `AttributeError`. Odporność na starcie kosztem jednej gałęzi.
 
 ---
 
@@ -1944,58 +2068,412 @@ CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
 **Znana luka:** `libs/observability` nie jest kopiowany ani installowany. `src/main.py` importuje `crediguard_observability`, ale w obrazie Docker ten pakiet nie istnieje. **W Docker build obraz się wysypie na starcie.** Rozwiązanie: dodać `crediguard-observability` do dependencies lub skopiować `libs/observability`.
 
+### 8.4 Analiza `pyproject.toml` — linia po linii (co tu nie gra)
+
+```toml
+[project]
+name = "crediguard-gateway"
+version = "0.1.0"
+description = "API Gateway - JWT validation, reverse proxy, rate limiting, SSE"
+readme = "README.md"              # ← pliku brak w katalogu! (jak w loan-app; pip ostrzega)
+requires-python = ">=3.12"        # ← stąd StrEnum-frozensety, X | None, datetime.UTC
+dependencies = [
+    "fastapi>=0.115.0", "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.9.2", "pydantic-settings>=2.5.2",   # ← pydantic BEZPOŚREDNIO nieużywane?
+    "python-jose[cryptography]>=3.3.0",              # ← transitive cryptography dla testów (G-5!)
+    "structlog>=24.4.0",                             # ← używane pośrednio (via libs/observability)
+    "httpx>=0.27.2", "redis>=5.0.0",                 # ← oba używane (proxy, limiter)
+]
+```
+
+- `pydantic` w deps, ale kod importuje tylko `pydantic_settings` (config) — goły `pydantic` przychodzi transitive. Deklaracja nieszkodliwa (jawność), ale myląca (sugeruje modele Pydantic w gateway — a gateway celowo ich nie ma!).
+- `structlog` deklarowane, importowane tylko przez `libs/observability` (które... nie jest w deps ani kopiowane do obrazu — §8.3 luka! Dwie luki się zazębiają: obraz nie wstanie z importu w `main.py`).
+- Brak `crediguard-observability` w deps (do naprawy razem z Dockerfile — §8.3).
+
+```toml
+[project.optional-dependencies]
+dev = ["pytest>=8.3.3", "pytest-asyncio>=0.23.8", "pytest-httpx>=0.27.0",
+       "ruff>=0.6.9", "mypy>=1.13.0", "types-python-jose>=3.3.0"]
+# pytest-httpx: MARTWE (zero importów — G-6, użyć w §9.5 albo wywalić!)
+# types-python-jose: stubby typów (mypy strict widzi jwt.decode — bez nich Any!)
+
+[tool.ruff]
+target-version = "py312"          # ← 3.12: natywne generyki, StrEnum, X | None
+line-length = 100
+src = ["src"]                     # ← baza from src... (jak wszędzie w repo)
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4"]   # ← identyczne jak loan-app (konwencja repo!)
+ignore = ["B008", "B904", "UP045"]                 # ← B008: Depends() w defaultach (FastAPI!),
+                                                   #    B904: raise-from w except, UP045: Optional vs X|None
+[tool.mypy]
+python_version = "3.12"
+strict = true                     # ← sygnał seniorski (adnotacje wszędzie)
+namespace_packages = true
+explicit_package_bases = true     # ← jawne korzenie (7 serwisów × src/ w monorepo!)
+mypy_path = ["../../../libs/observability/src", "../../../libs/events/src"]
+# events/src w path mimo że gateway events NIE importuje (kopia configu z szablonu — nieszkodliwe)
+[tool.pytest.ini_options]
+asyncio_mode = "auto"                           # ← testy async bez markerów...
+asyncio_default_fixture_loop_scope = "function" # ← ...ale pętla per fixture (izolacja!)
+testpaths = ["tests"]                           # ← pytest bez args zbiera tests/ (nie src/!)
+```
+
+- Ruff/mypy/pytest config **identyczny** jak loan-app (poza kolejnością kluczy) — konwencja repo: nowy serwis kopiuje blok jakości 1:1 (pre-commit egzekwuje tak samo wszędzie).
+
 ---
 
-## 9. Testy
+## 9. Testy — jednostkowe (i luka integracyjna)
 
-Testy gateway są **jednostkowe** (brak testów integracyjnych). Testują trzy kluczowe aspekty: walidację JWT, przepisywanie nagłówków i rate limiting.
+> Piramida testów gateway jest ścięta: szeroka podstawa unit (3 pliki, 12 testów, milisekundy, zero Dockera) i **puste piętro integracji** (`tests/integration/` zawiera tylko `__init__.py`). To boli najbardziej właśnie tutaj: krytyczny bug `_match_route` (§11 luka G-1) przeszedłby każdy test integracyjny, a żaden unit go nie łapie (unit testuje `_rewrite_headers` i limiter w izolacji, nie dopasowanie ścieżek!).
 
-### 9.1 Narzędzia testowe
+### 9.0 Taksonomia — co gdzie i po co
 
-- **pytest** — framework testowy.
-- **`cryptography`** — generowanie kluczy RSA w fixture'ach testowych.
-- **`python-jose`** — kodowanie tokenów JWT testowych.
-- **`FakeRedis` / `FakePipe`** — ręczna implementacja Redis pipeline w pamięci.
-- **`ProxyService._rewrite_headers()`** — metoda prywatna testowana bezpośrednio.
+| Warstwa | Plik | Testów | Zależności | Co udowadnia |
+|---------|------|--------|------------|--------------|
+| unit | `test_token.py` | 5 | `cryptography` + `python-jose` (generowanie JWT w teście!) | walidacja RS256, odrzucanie refresh/śmieci |
+| unit | `test_proxy_headers.py` | 4 | brak (czysty `ProxyService`) | anti-spoofing nagłówków, correlation ID |
+| unit | `test_rate_limit.py` | 3 | `FakeRedis`/`FakePipe` (dict w pamięci) | sliding window: limit, blokada, izolacja kluczy |
+| integration | *(brak)* | 0 | — | dopasowanie tras, 401/404/429 end-to-end — NIEPOKRYTE |
 
-### 9.2 `tests/unit/test_token.py` — Walidacja JWT
+- Reguła jak w loan-app: logika w unit (szybko), granice (HTTP, Redis, trasy) w integracji. Tutaj granice nie są testowane wcale — stąd luka G-1 w §11.
 
-**Fixture: `keypair`** generuje parę kluczy RSA 2048-bit na potrzeby każdego testu. Gwarantuje izolację.
+### 9.1 Narzędzia testowe — linia po linii
 
-**Fixture: `validator`** tworzy `TokenValidator` z kluczem publicznym (nie zna prywatnego — tak jak w produkcji).
+- **pytest** — framework (asercje `assert` + `pytest.raises` + fixture'y). `asyncio_mode = "auto"` w `pyproject.toml` (testy `async def` bez markerów) + `asyncio_default_fixture_loop_scope = "function"` (osobna pętla per fixture — izolacja).
+- **`cryptography`** — generowanie pary RSA 2048-bit w fixture (`keypair`). Import wprost w teście (`from cryptography.hazmat...`), ale w `pyproject.toml` brak jawnego wpisu — działa tylko dzięki transitive `python-jose[cryptography]`! Usunięcie extra z jose wysypie testy (luka G-5 w §11: dopisać `cryptography` do dev-deps).
+- **`python-jose`** — kodowanie tokenów testowych (`jwt.encode(payload, private_pem, algorithm="RS256")`) — test podpisuje **prywatnym** (jak Applicant w produkcji), waliduje **publicznym** (jak gateway). Symetria test↔prod.
+- **`FakeRedis` / `FakePipe`** — ręczna symulacja pipeline Redis na `dict[str, list[float]]` (patrz §9.4).
+- **`ProxyService._rewrite_headers()`** — metoda prywatna testowana bezpośrednio (biała skrzynka: test zna implementację, nie tylko HTTP). Uzasadnione: to serce bezpieczeństwa nagłówków; test przez HTTP wymagałby TestClienta + mocka httpx (ciężkie). Cena: refaktor nazwy/metody psuje testy (sprzężenie test↔implementacja — akceptowane dla 4 testów).
+- **`pytest-httpx` w dev-deps — martwe!** Żaden test go nie importuje (grep pusty). Zależność z szablonu, nieużywana — do wywalenia (luka G-4). To właśnie nim napisano by testy integracyjne proxy (mock transportu httpx) — albo TestClient + respx. Narzędzie czeka na użycie.
 
-**Helper: `_access_token`** koduje access token z podanym `sub` kluczem prywatnym.
+### 9.2 `tests/unit/test_token.py` (74 linie) — walidacja JWT, test po teście
 
-| Test | Co sprawdza |
-|------|------------|
-| `test_valid_access_token_returns_applicant_id` | Poprawny token → zwraca UUID |
-| `test_missing_authorization_header_raises` | `None` → `InvalidTokenError` |
-| `test_non_bearer_header_raises` | `"Token abc"` → `InvalidTokenError` |
-| `test_refresh_token_is_rejected` | Token z `type: "refresh"` → `InvalidTokenError` |
-| `test_garbage_token_raises` | `"not.a.token"` → `InvalidTokenError` |
+```python
+"""Unit tests for JWT token validation in the gateway."""
 
-### 9.3 `tests/unit/test_proxy_headers` — Przepisywanie nagłówków
+from __future__ import annotations
 
-Testują `_rewrite_headers` z różnymi scenariuszami:
+from typing import Any
+from uuid import uuid4
 
-| Test | Co sprawdza |
-|------|------------|
-| `test_strips_spoofed_user_headers_and_authorization` | Fałszywy `X-User-ID` usunięty, prawdziwy wstrzyknięty |
-| `test_public_routes_forward_without_identity` | Brak `X-User-ID` dla publicznych endpointów |
-| `test_correlation_id_is_always_forwarded` | `X-Correlation-ID` zawsze obecny |
-| `test_hop_by_hop_headers_are_not_forwarded` | `Connection`, `Transfer-Encoding`, `Host` usunięte |
+import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+from jose import jwt
+from src.services.token import InvalidTokenError, TokenValidator
 
-### 9.4 `tests/unit/test_rate_limit.py` — Rate Limiting
+KeyPair = tuple[bytes, bytes]
+```
 
-Używa **FakeRedis** — ręcznej implementacji Redis pipeline (bez realnego Redis).
+- **Linia `KeyPair = tuple[bytes, bytes]`:** alias typu (prywatny PEM, publiczny PEM) — czytelność sygnatur fixture'ów (`def keypair() -> KeyPair` zamiast krotki bez znaczenia). Dla laika: alias nie tworzy nowego typu (mypy widzi zwykłą krotkę!), tylko nazwę-dokumentację.
+- **Import `RSAPrivateKey`:** tylko do adnotacji (`key: RSAPrivateKey` — mypy wie, że `.private_bytes()` istnieje). Bez adnotacji `rsa.generate_private_key` zwracałby... to samo, ale niejawną wiedzę (IDE nie podpowiada).
 
-**FakePipe** implementuje `zremrangebyscore`, `zcard`, `zadd`, `expire` jako operacje na `dict[str, list[float]]`. Symuluje atomowość pipeline.
+```python
+@pytest.fixture()
+def keypair() -> KeyPair:
+    from cryptography.hazmat.primitives.asymmetric import rsa
 
-| Test | Co sprawdza |
-|------|------------|
-| `test_allows_up_to_limit` | 3 żądania na limit 3 → wszystkie `True` |
-| `test_exceeding_limit_is_blocked` | 4. żądanie → `False` |
-| `test_different_keys_do_not_interfere` | Różne klucze (IP) nie wpływają na siebie |
+    key: RSAPrivateKey = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+```
+
+- **`@pytest.fixture()`** (z nawiasami — równoważne `@pytest.fixture`; nawiasy sugerują parametryzację w przyszłości). Scope default (`function` — świeża para kluczy **per test**! izolacja: test nie widzi kluczy innego).
+- **Import `rsa` wewnątrz fixture (defer):** ciężki import kryptografii tylko gdy fixture użyte (testy nagłówków go nie potrzebują — szybszy start kolekcji). Konwencja dyskusyjna (jak defer w loan-app workerze), tu uzasadniona kosztem importu.
+- **`public_exponent=65537, key_size=2048`:** standardowe parametry RSA (65537 = Fermat F4 — szybka weryfikacja; 2048 bitów = minimum prod, generowanie ~0,1–0,5 s per test — cena izolacji; 5 testów × 2 fixture'ów... `keypair` wołane raz per test (cache fixture w teście!), więc ~5 generowań na plik).
+
+```python
+    private_pem: bytes = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_pem: bytes = key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return private_pem, public_pem
+```
+
+- **Formaty:** prywatny PKCS#8 bez hasła (`NoEncryption` — test, nie prod; klucz istnieje milisekundy w pamięci), publiczny SubjectPublicKeyInfo (format, który `Settings.jwt_public_key` czyta z pliku w produkcji — ten sam kształt PEM!). Test mówi tym samym „dialektem kluczy" co prod.
+- **Kolejność krotki** (prywatny, publiczny) — konwencja pliku; `validator` bierze `[1]`, `_access_token` bierze `[0]`. Pomyłka indeksu = test szyfruje publicznym (fail) — jawne rozpakowanie (`private_pem, _ = keypair`) zamiast `[0]` eliminuje pomyłkę.
+
+```python
+@pytest.fixture()
+def validator(keypair: KeyPair) -> TokenValidator:
+    _, public_pem = keypair
+    return TokenValidator(public_pem)
+```
+
+- **Kompozycja fixture'ów** (`validator` zależy od `keypair` — pytest buduje graf, jak FastAPI `Depends`!). Validator zna **tylko publiczny** (jak w produkcji — test nie mógłby oszukiwać, nawet gdyby chciał).
+
+```python
+def _access_token(keypair: KeyPair, sub: str) -> str:
+    private_pem, _ = keypair
+    payload: dict[str, Any] = {"sub": sub, "email": "a@b.c", "type": "access"}
+    return jwt.encode(payload, private_pem, algorithm="RS256")
+```
+
+- **Helper (nie fixture!):** funkcja z parametrem `sub` (fixture'y nie przyjmują argumentów — helper tak). Payload minimalny, ale kompletny dla walidatora (`sub` + `type: access`; `email` — bo prod-tokeny je niosą, choć gateway ignoruje). `dict[str, Any]` (wartości heterogeniczne — jak payload outbox w loan-app).
+
+```python
+def test_valid_access_token_returns_applicant_id(
+    keypair: KeyPair, validator: TokenValidator
+) -> None:
+    uid = uuid4()
+    token = _access_token(keypair, str(uid))
+    assert validator.validate(f"Bearer {token}") == uid
+```
+
+- Losowy `uid` per wykonanie (nie stały! — stały UUID w teście kusiłby do „test przechodzi, bo dane pasują", losowy dowodzi ogólności). Asercja `== uid` (UUID, nie string — walidator zwraca sparsowany UUID, test to weryfikuje).
+- **Testy synchroniczne** (`def` — `validate` jest synchroniczne; brak I/O w walidacji — celowo, patrz §6.4 loan-app... tu: §6.4 tego guide).
+
+```python
+def test_missing_authorization_header_raises(validator: TokenValidator) -> None:
+    with pytest.raises(InvalidTokenError):
+        validator.validate(None)
+
+
+def test_non_bearer_header_raises(validator: TokenValidator) -> None:
+    with pytest.raises(InvalidTokenError):
+        validator.validate("Token abc")
+```
+
+- Dwa warianty „brak poprawnego Bearer": `None` (klient nic nie wysłał) i `"Token abc"` (zły schemat — uwaga: `"Token abc"` nie zaczyna się od `"Bearer "`, więc odpada na prefiksie, nie na dekodowaniu!). Bez asercji komunikatu (luźniej niż loan-app — zmiana zdania nie psuje testu; test pinuje typ wyjątku, nie treść).
+
+```python
+def test_refresh_token_is_rejected(keypair: KeyPair, validator: TokenValidator) -> None:
+    private_pem, _ = keypair
+    payload: dict[str, Any] = {"sub": str(uuid4()), "type": "refresh"}
+    refresh = jwt.encode(payload, private_pem, algorithm="RS256")
+    with pytest.raises(InvalidTokenError):
+        validator.validate(f"Bearer {refresh}")
+```
+
+- **Najważniejszy test bezpieczeństwa pliku:** poprawnie podpisany, niewygasły token — ale `type: refresh` (nie `access`) → odrzut. Bez linii `payload.get("type") != "access"` w `token.py` ten test pada (a refresh token wędrujący po wewnętrznych serwisach jako tożsamość to dziura: refresh żyje 7 dni, access 15 min!). Test pinuje politykę „tylko access".
+- **Dlaczego własny payload, nie `_access_token`?** Bo helper szyje `type: access` na sztywno (parametr `sub` tylko). Test negatywny potrzebuje innego typu — buduje payload ręcznie. Alternatywa: parametr `type` w helperze (`_token(keypair, sub, type="access")`) — czytelniej, mniej duplikacji (dług kosmetyczny).
+
+```python
+def test_garbage_token_raises(validator: TokenValidator) -> None:
+    with pytest.raises(InvalidTokenError):
+        validator.validate("Bearer not.a.token")
+```
+
+- `"not.a.token"` (trzy segmenty jak JWT, ale losowe bajty — podpis się nie zgadza → `JWTError` → `InvalidTokenError`). Test pinuje, że śmieci nie przechodzą (brzmi banalnie — ale bez `algorithms=[RS256]` (whitelista) atak „algorithm confusion" (HS256 z publicznym jako sekretem) mógłby przejść! Ten test + `test_refresh_token_is_rejected` to dwa strażnicy kryptografii.
+- **Czego brak w pliku:** test wygasłego tokena (`exp` w przeszłości → `JWTError` — niepokryte! `python-jose` weryfikuje `exp` domyślnie, ale żaden test tego nie dowodzi; ktoś wyłączający weryfikację (`options={"verify_exp": False}`) nie zostanie złapany), test złego podpisu (token podpisany **innym** kluczem — najważniejszy scenariusz! dziś niepokryty wprost), test `sub` nie-UUID (`ValueError` → `InvalidTokenError` — niepokryte). Trzy testy do dopisania (luka G-3 w §11).
+
+### 9.3 `tests/unit/test_proxy_headers.py` (63 linie) — anti-spoofing, test po teście
+
+```python
+"""Unit tests for the gateway reverse-proxy header rewriting (spec §8). ... """
+
+from __future__ import annotations
+
+from src.services.proxy import ProxyService
+
+
+def _proxied_headers(
+    proxy: ProxyService, incoming: dict[str, str], *, applicant_id: str | None
+) -> dict[str, str]:
+    headers = proxy._rewrite_headers(
+        incoming,
+        applicant_id=applicant_id,
+        correlation_id="corr-123",
+    )
+    return {k.decode(): v.decode() for k, v in headers}
+```
+
+- **Helper `_proxied_headers`:** woła **prywatną** `_rewrite_headers` (biała skrzynka — §9.1) ze stałym `correlation_id="corr-123"` i konwertuje wynik (`list[tuple[bytes, bytes]]` → `dict[str, str]`) do wygodnych asercji. Stały correlation izoluje testy nagłówków od logiki correlation (testowana osobno w `test_correlation_id_is_always_forwarded`).
+- **`*, applicant_id`:** keyword-only (po `*` — wołający musi nazwać: `applicant_id="..."`, nie pozycyjnie; czytelność + odporność na przestawienie).
+- **Konwersja `.decode()` (UTF-8 default):** nagłówki testowe to ASCII — bezpieczne. Gdyby test słał latin-1 (`"zażółć"`), decode padłby (testy trzymają się ASCII — słusznie, bo `_rewrite_headers` koduje `latin-1, ignore`).
+
+```python
+def test_strips_spoofed_user_headers_and_authorization() -> None:
+    proxy = ProxyService()
+    incoming = {
+        "X-User-ID": "attacker-supplied",
+        "X-User-Roles": "admin",
+        "Authorization": "Bearer attacker-token",
+        "Content-Type": "application/json",
+    }
+    headers = _proxied_headers(proxy, incoming, applicant_id="real-uuid")
+
+    assert "X-User-ID" in headers
+    assert headers["X-User-ID"] == "real-uuid"
+    assert "X-User-Roles" in headers
+    assert headers["X-User-Roles"] == "applicant"
+    assert "Authorization" not in headers
+```
+
+- **Scenariusz ataku wprost:** klient podrabia `X-User-ID`, nadaje sobie `admin`, podtyka cudzy Bearer. Oczekiwane: fałszywe wyrzucone, wstrzyknięte prawdziwe (`real-uuid` + `applicant`), `Authorization` nie idzie dalej (wewnętrzne serwisy go nie potrzebują — tożsamość jest w `X-User-ID`).
+- **`ProxyService()` per test** (konstruktor tworzy `httpx.AsyncClient` — nieużywany w teście nagłówków! Każde `ProxyService()` otwiera pulę połączeń, która nigdy nie jest zamykana (`aclose` nie wołane — warning `Unclosed client` w logach? `httpx.AsyncClient` bez atm... tworzy obiekty bez socketów do pierwszego requestu, więc cicho — ale marnotrawstwo + zapach: test nagłówków nie powinien tworzyć klienta HTTP. Dług: fabryka/klasa-metoda dla `_rewrite_headers` (staticmethod?) — §11).
+- **Asercja `"X-User-Roles" == "applicant"`** (nie `"admin"`!): gateway **degraduje** role do defaultu (nie ma RBAC — każdy zalogowany to applicant). Test pinuje, że nawet jawne `admin` od klienta nie przechodzi.
+- **Czego brak:** test, że `Content-Type: application/json` **przechodzi** (passthrough zwykłych nagłówków — niepokryte! ktoś rozszerzający `_BLOCKED_HEADERS` o `content-type` zepsułby POST-y, a testy milczą), test case-insensitive (`"x-user-id"` małymi też stripowane? implementacja lowercases (`lk = k.lower()`), ale test woła tylko wielkoliterowe warianty — luka pokrycia), test `X-Correlation-ID` od klienta (stripowany + nadpisywany `corr-123`? niepokryte!).
+
+```python
+def test_public_routes_forward_without_identity() -> None:
+    proxy = ProxyService()
+    headers = _proxied_headers(proxy, {"Content-Type": "application/json"}, applicant_id=None)
+    assert "X-User-ID" not in headers
+    assert "X-User-Roles" not in headers
+    assert "X-Correlation-ID" in headers
+```
+
+- `applicant_id=None` (ścieżka publiczna — brak tożsamości do wstrzyknięcia). Trzy asercje: brak ID, brak ról, **obecny correlation** (śledzenie działa i bez logowania — ważne dla debugowania 401!).
+
+```python
+def test_correlation_id_is_always_forwarded() -> None:
+    proxy = ProxyService()
+    headers = _proxied_headers(proxy, {}, applicant_id=None)
+    assert headers["X-Correlation-ID"] == "corr-123"
+```
+
+- Pusty input (`{}`) → i tak wychodzi correlation (gateway zawsze dokleja — downstream zawsze może korelować). Jedna asercja na równość (nie tylko obecność — pinuje wartość, czyli że to **ten** correlation, nie losowy).
+
+```python
+def test_hop_by_hop_headers_are_not_forwarded() -> None:
+    proxy = ProxyService()
+    headers = _proxied_headers(
+        proxy,
+        {"Connection": "keep-alive", "Transfer-Encoding": "chunked", "Host": "evil.com"},
+        applicant_id=None,
+    )
+    for blocked in ("Connection", "Transfer-Encoding", "Host"):
+        assert blocked not in headers
+```
+
+- `Host: evil.com` (atak Host-header: wewnętrzny serwis mógłby ufać Host przy generowaniu linków/resetów — gateway obcina). Pętla po trzech (jak test terminali w loan-app — ten sam dług: `parametrize` dałby osobne wyniki per nagłówek; dziś pierwszy fail przerywa).
+- **Czego brak:** `Content-Length` i `Upgrade` z `_BLOCKED_HEADERS` niepokryte (5 blokowanych, 3 testowane — `content-length` krytyczne dla streamingu!).
+
+### 9.4 `tests/unit/test_rate_limit.py` (92 linie) — FakeRedis rozebrany
+
+```python
+"""Unit tests for the sliding-window rate limiter using a fake Redis."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from src.infrastructure.rate_limit import SlidingWindowRateLimiter
+
+
+class FakePipe:
+    """In-process simulation of a Redis pipeline (transactions disabled, ordered)."""
+
+    def __init__(self, store: dict[str, list[float]]) -> None:
+        self._store = store
+        self._ops: list[Any] = []
+```
+
+- **Docstring uczciwy:** „transactions disabled, ordered" — fake symuluje kolejność, nie atomowość (prawdziwy pipeline z `transaction=True` serializuje; fake wykonuje sekwencyjnie w jednym wątku — wyścigi nieprzetestowane! Test udowadnia logikę zliczania, nie bezpieczeństwo współbieżne. Do udowodnienia atomowości potrzebny prawdziwy Redis + równoległe taski — integracja, której nie ma).
+- `store: dict[str, list[float]]` (klucz → lista timestampów; sorted-set udawany listą — bez sortowania i unikalności memberów! Prawdziwy ZADD z tym samym memberem nadpisuje score (nie duplikuje); fake `extend` duplikuje. Przy `str(now)` jako memberze kolizje praktycznie nie występują (float z mikrosekundami), więc rozjazd nie psuje testów — ale fake nie jest wierny (dokumentuje to tylko docstring).
+- `_ops: list[Any]` (kolejka operacji — `zremrangebyscore`/`zcard`/itd. tylko **zapisują** intencję (`self._ops.append(...)`) i zwracają `self` (łańcuchowanie jak prawdziwy pipe!), wykonanie w `execute()`.
+
+```python
+    def zremrangebyscore(self, key: str, min_: float, max_: float) -> FakePipe:
+        self._ops.append(("zrem", key, min_, max_))
+        return self
+
+    def zcard(self, key: str) -> FakePipe:
+        self._ops.append(("zcard", key))
+        return self
+
+    def zadd(self, key: str, mapping: dict[str, float]) -> FakePipe:
+        self._ops.append(("zadd", key, list(mapping.values())))
+        return self
+
+    def expire(self, key: str, seconds: int) -> FakePipe:
+        self._ops.append(("expire", key, seconds))
+        return self
+```
+
+- Cztery metody mirrorujące API `redis.asyncio` (nazwy małą literą jak w bibliotece: `zremrangebyscore`, nie `zRemRangeByScore`). `min_` z podkreślnikiem (`min` to wbudowana funkcja — `min_` unika cieniowania; konwencja PEP8 dla kolizji z builtinami). `zadd` bierze tylko `list(mapping.values())` (score'e; membery ignoruje — fake nie potrzebuje unikalności). Zwrot `self` (fluent interface — `pipe.zrem...zcard...zadd...expire` w jednym łańcuchu, dokładnie jak kod produkcyjny!).
+- **Synchroniczne** (prawdziwe metody pipe są synchroniczne do `execute` — fake wierny! `async with pipeline() as pipe` + `await pipe.execute()` — jedyny await w całym teście).
+
+```python
+    async def __aenter__(self) -> FakePipe:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        pass  # mutations happen inside execute()
+
+    async def execute(self) -> list[float]:
+        results: list[float] = []
+        for op in self._ops:
+            kind = op[0]
+            if kind == "zrem":
+                key: str = op[1]
+                lo: float = float(op[2])
+                hi: float = float(op[3])
+                before = len(self._store.get(key, []))
+                self._store[key] = [v for v in self._store.get(key, []) if not (lo <= v <= hi)]
+                results.append(float(before - len(self._store[key])))
+            elif kind == "zcard":
+                results.append(float(len(self._store.get(op[1], []))))
+            elif kind == "zadd":
+                key = op[1]
+                self._store.setdefault(key, []).extend(op[2])
+                results.append(1.0)
+            elif kind == "expire":
+                results.append(1.0)
+        return results
+```
+
+- `__aenter__`/`__aexit__` (protokołu async context manager — `async with` w limiterze wymaga obu; `__aexit__` z `*_: object` (ignoruje typ wyjątku/wartość/traceback — fake nie sprząta). Komentarz `mutations happen inside execute()` dokumentuje uproszczenie (prawdziwy pipe z transaction wykonuje przy wyjściu z kontekstu... dokładnie: `execute()` jawnie — tu też jawnie; zgodne!).
+- `execute` interpretuje kolejkę po kolei (krotki `("zrem", key, lo, hi)` — mini-VM z czterema instrukcjami!). `zrem`: filtr listy (`not (lo <= v <= hi)` — przedział domknięty jak `ZREMRANGEBYSCORE`), wynik = liczba usuniętych (jak Redis!). `zcard`: długość (jak Redis!). `zadd`/`expire`: `1.0` (sukces — jak Redis!).
+- **Wyniki jako `float`** (prawdziwy Redis zwraca inty!): limiter robi `int(result[1])` — działa dla obu (int(3.0)==3). Fake celowo(?) luźniejszy niż prod — test przechodzi mimo rozjazdu typów. Gdyby limiter robił `result[1] == 3` (bez int), fake by nie wyłapał buga działającego na prod. Dług: `list[int]` w fake'u (wierność typom!).
+- **Brak czyszczenia `_ops` po `execute`:** drugie `execute` na tym samym pipe powtórzyłoby operacje (prawdziwy pipe też tak się zachowuje? redis-py czyści... nieistotne: limiter woła raz per `allowed`).
+
+```python
+class FakeRedis:
+    def __init__(self) -> None:
+        self._store: dict[str, list[float]] = {}
+
+    def pipeline(self, **_: object) -> FakePipe:
+        return FakePipe(self._store)
+
+
+def _limiter() -> SlidingWindowRateLimiter:
+    return SlidingWindowRateLimiter(FakeRedis())  # type: ignore[arg-type]
+```
+
+- `pipeline(**_: object)` (połyka `transaction=True` — fake ignoruje transakcyjność, patrz docstring FakePipe). `# type: ignore[arg-type]` (fake nie jest `Redis` — jak `type: ignore` w loan-app `test_get_loan.py`; świadome, minimalne).
+- `_limiter()` helper (świeży limiter + świeży store per test — izolacja: testy nie widzą swoich timestampów!).
+
+```python
+async def test_allows_up_to_limit() -> None:
+    limiter = _limiter()
+    results = [await limiter.allowed("loans:u1", 3, 600) for _ in range(3)]
+    assert results == [True, True, True]
+
+
+async def test_exceeding_limit_is_blocked() -> None:
+    limiter = _limiter()
+    for _ in range(3):
+        assert await limiter.allowed("auth:1.2.3.4", 3, 60) is True
+    assert await limiter.allowed("auth:1.2.3.4", 3, 60) is False
+
+
+async def test_different_keys_do_not_interfere() -> None:
+    limiter = _limiter()
+    assert await limiter.allowed("auth:1.2.3.4", 2, 60) is True
+    assert await limiter.allowed("auth:1.2.3.4", 2, 60) is True
+    assert await limiter.allowed("auth:5.6.7.8", 2, 60) is True
+    assert await limiter.allowed("auth:1.2.3.4", 2, 60) is False
+    assert await limiter.allowed("auth:5.6.7.8", 2, 60) is True  # different key still has room
+```
+
+- Trzy scenariusze: limit (3× True na limit 3 — granica inkluzywna: `count < limit`, trzecie przechodzi bo count=2!), blokada (4. żądanie False), izolacja kluczy (IP .4 wyczerpany, .8 ma miejsce — limity per klucz, nie globalne!). Klucze jak w produkcji (`loans:u1`, `auth:1.2.3.4` — format `prefix:id` z `_rate_key`).
+- **`is True`/`is False`** (nie truthiness — `allowed` zwraca czysty bool; test pinuje typ, nie tylko „prawdziwość". `1 == True` w Pythonie, ale `1 is True` to False — gdyby limiter zwrócił `1`, test by padł. Dobre.).
+- **Testy asynchroniczne** (jedyne `async def` w testach gateway — limiter jest async, bo prawdziwy Redis to I/O; fake też async dla zgodności interfejsu).
+- **Czego brak:** test wygasania okna (time travel — `time.time` nie mockowany; okno 60 s nieprzetestowane: czy stare wpisy wypadają? Fake wspiera (`zrem` z zakresem!), ale żaden test nie cofa zegara. Do przetestowania: monkeypatch `time.time` + dwa ticki), test `expire` (TTL klucza — fake zwraca 1.0 i nic nie robi; wygaśnięcie klucza nieprzetestowane nigdzie!), test współbieżności (dwa taski naraz — atomowość pipeline; wymaga prawdziwego Redis).
+
+### 9.5 Luka: brak testów integracyjnych (krytyczna)
+
+`tests/integration/` zawiera tylko `__init__.py`. Niepokryte (a krytyczne dla bramy!):
+
+- **Dopasowanie tras** (`_match_route` + pełna tabela): bug G-1 (§11) — każde żądanie 404 — przeszedłby każdy test integracyjny (`TestClient(app).post("/api/v1/auth/register")` → assert nie-404), a żaden unit go nie łapie. Jeden test wart więcej niż cała reszta pliku.
+- **Ścieżki 401/404/429** przez `proxy_endpoint` (TestClient + mock `ProxyService.forward` + FakeRedis): dziś logika statusów (503/404/401/400/429) nieprzetestowana wcale (unit testuje składowe, nie orkiestrację!).
+- **Deviacje routingu** (documents → zły serwis, events → proxy zamiast stub — §11 G-2): test `POST /api/v1/loans/123/documents` z mockiem httpx pokazałby zły `base_url` natychmiast.
+- **Plan:** `pytest-httpx` (już w dev-deps! — wreszcie użycie) do mockowania transportu + `httpx.ASGITransport`/`TestClient` do wołania app. Najpierw test G-1 (czerwony!), potem fix kodu (osobny PR — ten guide kodu nie rusza).
 
 ---
 
@@ -2026,7 +2504,7 @@ Gateway używa `stream=True` w httpx + `StreamingResponse` w FastAPI. Nie buforu
 
 ### 10.5 `Protocol` zamiast `ABC` dla RateLimiter
 
-`RateLimiter` jest `Protocol` (structural subtyping), nie `ABC` (nominal subtyping). `FakeRedis` w testach nie musi显式 dziedziczyć po `RateLimiter` — wystarczy, że ma metodę `allowed`. Upraszcza testy.
+`RateLimiter` jest `Protocol` (structural subtyping), nie `ABC` (nominal subtyping). `FakeRedis` w testach nie musi jawnie (explicit) dziedziczyć po `RateLimiter` — wystarczy, że ma metodę `allowed`. Upraszcza testy.
 
 ### 10.6 Obszary do poprawy (wnioski z analizy)
 
@@ -2055,6 +2533,12 @@ Gateway używa `stream=True` w httpx + `StreamingResponse` w FastAPI. Nie buforu
 | Dockerfile: libs/observability | — | Nie skopiowany | Bug |
 | `path_prefix` z `{id}` | — | Dosłowny string, nie pattern | Bug |
 | Brak Retry-After w 429 | HTTP RFC 7231 | Brak nagłówka | Missing feature |
+| **G-1: `_match_route` nigdy nie matchuje (wiodący `/`)** | — | Każde żądanie → 404 | **Bug krytyczny (zweryfikowany empirycznie)** |
+| **G-2: documents proxyjowane do złego serwisu** | §4.1: documents → Document | `/api/v1/loans/*` łapie wszystko → loan-application:8002 | **Bug krytyczny** |
+| **G-3: brak CORS + brak OPTIONS** | §8: CORS tylko origin frontendu | Brak `CORSMiddleware`, brak OPTIONS w methods | Deviation (frontend z przeglądarki nie zadzwoni) |
+| **G-4: timeout upstream → 500 zamiast 504** | — | Brak `try/except` wokół `forward()` | Bug (30 s czekania + zły kod) |
+| **G-5: `cryptography` niejawną zależnością testów** | — | Import wprost w teście, tylko transitive via `python-jose[cryptography]` | Dług higieniczny |
+| **G-6: `pytest-httpx` nieużywane** | — | W dev-deps, zero importów w testach | Dług higieniczny |
 
 ### 11.2 Szczegółowe opisy luk
 
@@ -2082,6 +2566,55 @@ HTTP RFC 7231 rekomenduje nagłówek `Retry-After` w odpowiedzi 429. Gateway nie
 #### `path_prefix` z `{id}` — bug
 
 `/api/v1/loans/{id}` jest dosłownym stringiem w `path_prefix`. `_match_route` sprawdza `path.startswith("/api/v1/loans/{id}/")` — ale żądanie `/api/v1/loans/123` nie zaczyna się od `/api/v1/loans/{id}/`. W praktyce route `/api/v1/loans/{id}` nigdy nie pasuje (jedyny pasujący route to `/api/v1/loans`). Konsekwencja: nie ma osobnej obsługi per-loan (GET/PUT/PATCH/DELETE) — wszystko idzie przez route `/api/v1/loans`.
+
+#### G-1 (KRYTYCZNY): `_match_route` nie matchuje niczego — wiodący `/`
+
+**Weryfikacja empiryczna** (uruchomiony kod, nie spekulacja):
+
+```python
+_match_route('api/v1/loans/123')   # → None  (tak Starlette daje path: BEZ slash!)
+_match_route('/api/v1/loans/123')  # → Route('/api/v1/loans', ...)  (tak testuje człowiek)
+```
+
+Mechanika: catch-all `/{path:path}` w Starlette obcina wiodący `/` (`/api/v1/x` → `path="api/v1/x"` — guide §4.8 to poprawnie dokumentuje!). Ale `_match_route` porównuje `path == r.path_prefix` (prefixy ZE slashem: `/api/v1/...`) i `path.startswith(prefix + "/")` (też ze slashem). `"api/..." == "/api/..."` → False; `"api/...".startswith("/api/...")` → False. **Żaden route nigdy nie pasuje → każde żądanie przez gateway kończy się 404** (register, login, loans — wszystko!).
+
+- Dlaczego testy milczą: unit testuje składowe (`_rewrite_headers`, limiter, validator), a `_match_route` nie ma żadnego testu (ani unit, ani integracji — §9.5). Jeden test integracyjny (`TestClient(app).post("/api/v1/auth/register")` → assert ≠ 404) złapałby to natychmiast.
+- Poprawka kodu (osobny PR — ten dokument kodu nie rusza): normalizacja na wejściu (`path = "/" + path.lstrip("/")` w `proxy_endpoint` albo w `_match_route`) + test integracyjny per route z tabeli (§1.2).
+- Status: **DoD Etapu 2 („rejestracja/login działa wyłącznie przez :8000") jest formalnie niespełnione** dopóki G-1 żyje. Najwyższy priorytet w całym repo.
+
+#### G-2 (KRYTYCZNY): upload dokumentów proxyjowany do złego serwisu
+
+**Weryfikacja empiryczna** (pełna tabela tras, ścieżki ze slashem — czyli po hipotetycznej naprawie G-1):
+
+```python
+_match_route('/api/v1/loans/123/documents')  # → ('/api/v1/loans', 'http://loan-application:8002')
+_match_route('/api/v1/loans/123/events')     # → ('/api/v1/loans', 'http://loan-application:8002')
+```
+
+Wpis `/api/v1/loans/{id}/documents → document:8003` jest martwy (literal `{id}` nie występuje w realnych ścieżkach), więc longest-prefix wybiera `/api/v1/loans` → **upload dokumentu ląduje w loan-application:8002** (który nie ma endpointu upload → 404/405 z serwisu, nie z gateway). Etap 6 (Document + dropzone na froncie) nie zadziała bez naprawy routingu — a stub SSE (`base_url=""`) jest nieosiągalny (request idzie proxy, nie w gałąź SSE — patrz poprawiony §5.4.2).
+
+- Poprawka kodu: trasy z segmentami dynamicznymi jako regex/konwertery (np. prefix `/api/v1/loans/` + parsowanie segmentów) albo jawna kolejność „najpierw konkrety z `{}`" z podstawianiem. Minimum: test per wiersz tabeli routingu.
+
+#### G-3: brak CORS i brak OPTIONS — przeglądarka nie zadzwoni
+
+`main.py` wpina tylko `CorrelationIdMiddleware` (brak `CORSMiddleware`!), a catch-all obsługuje GET/POST/PUT/PATCH/DELETE (brak OPTIONS). Konsekwencje dla frontendu (Etap 5, Next.js w przeglądarce):
+
+- Preflight CORS (OPTIONS przed POST z `Content-Type: application/json` / `Authorization`) → **405 Method Not Allowed** (brak handlera OPTIONS).
+- Nawet prosty GET: brak nagłówka `Access-Control-Allow-Origin` w odpowiedzi → przeglądarka **blokuje odczyt** (same-origin policy), mimo że serwer odpowiedział 200.
+- SPEC §8 wymaga „CORS: tylko origin frontendu" — gateway tego nie implementuje wcale (ani allow, ani deny — po prostu cisza).
+- Poprawka: `CORSMiddleware(allow_origins=[frontend_url], allow_methods=[...], allow_headers=["Authorization", "Content-Type", "Idempotency-Key", ...])` + OPTIONS w catch-all (lub osobny handler). Bez tego DoD Etapu 5 („pełny flow w przeglądarce") jest niemożliwe — curl działa, przeglądarka nie.
+
+#### G-4: timeout upstream → 500 po 30 s (zamiast 504)
+
+Brak `try/except` wokół `await _proxy.forward(...)` (§4.8 Blok 5): `httpx.TimeoutException` (serwis wisi >30 s), `httpx.ConnectError` (serwis padł) i każdy inny błąd sieci propaguje się do FastAPI → generyczne **500** (nie 504/503/502!). Klient czeka pełne 30 s i dostaje najmniej informatywny kod. Poprawka: mapowanie (`TimeoutException → 504`, `ConnectError → 503`/`502`) + timeout per serwis (auth 5 s, loans 10 s, documents 30 s — upload!) + circuit breaker (FAQ w §12.4 już to postuluje).
+
+#### G-5: `cryptography` niejawną zależnością testów
+
+`test_token.py` importuje `cryptography` wprost (linia 9–10), ale `pyproject.toml` nie deklaruje go w dev-deps (jest tylko transitive przez `python-jose[cryptography]`). Działa dziś (`pip` dociąga extra), padnie jutro (gdy jose zmieni extra lub resolver wybierze wariant bez). Poprawka: jedna linia w dev-deps (`"cryptography>=41.0.0"`). Koszt minuty, ryzyko realne w CI z `--no-deps`-podobnymi optymalizacjami.
+
+#### G-6: `pytest-httpx` w dev-deps, zero użyć w testach
+
+`pytest-httpx>=0.27.0` zadeklarowane, żaden test go nie importuje (grep pusty — zweryfikowane). Dwie drogi: wywalić (higiena) albo **użyć** (testy integracyjne proxy z §9.5 — mock transportu httpx + TestClient!). Rekomendacja: zostawić i użyć (narzędzie czeka na zadanie, nie na śmietnik).
 
 ---
 
@@ -2161,8 +2694,8 @@ sequenceDiagram
     RED-->>RL: count = 1 (przed dodaniem)
     RL-->>GW: True (1 < 3)
     GW->>LOAN: POST /api/v1/loans (X-User-ID: uuid-123)
-    LOAN-->>GW: 201 {loan_id: "abc"}
-    GW-->>C: 201 Created
+    LOAN-->>GW: 202 Accepted (loan-application zwraca 202, nie 201!)
+    GW-->>C: 202 Accepted (gateway przekazuje status transparentnie)
 ```
 
 #### 12.1.4 Przepływ błędu 429 (rate limit exceeded)
@@ -2219,30 +2752,40 @@ sequenceDiagram
 | Wydajność | szybsza | nieco wolniejsza |
 | Użycie | proste limity | **wybrane** (CrediGuard) |
 
-### 12.3 Glosariusz
+### 12.3 Glosariusz (rozszerzony)
 
 | Pojęcie | Proste wyjaśnienie |
 |---------|--------------------|
-| **Reverse proxy** | Serwer pośredni przekazujący żądania do właściwych serwerów docelowych |
-| **Edge service** | Serwis stojący na granicy systemu (internet → wewnętrzna sieć) |
-| **BFF** | Backend for Frontend — serwis zoptymalizowany pod konkretngo klienta |
-| **JWT** | JSON Web Token — podpisany token potwierdzający tożsamość |
-| **RS256** | RSA Signature with SHA-256 — asymetryczny algorytm podpisu JWT |
-| **Header rewriting** | Usuwanie/wstrzykiwanie nagłówków HTTP przez proxy |
-| **Anti-spoofing** | Ochrona przed podszywaniem tożsamości (nagłówki X-User-ID) |
-| **Hop-by-hop** | Nagłówki przeznaczone dla jednego "hop" (nie end-to-end) |
-| **Sliding window** | Przesuwne okno czasowe dla rate limitingu |
-| **Sorted Set** | Struktura danych Redis: zbiór elementów posortowanych wg score |
-| **Pipeline** | Kolejka komend Redis wysyłanych hurtowo (jeden round-trip) |
-| **Transaction** | Atomowe wykonanie komend Redis (MULTI/EXEC) |
-| **Streaming** | Strumieniowanie danych "na bieżąco" bez buforowania |
-| **httpx** | Nowoczesny klient HTTP dla Pythona (async, connection pooling) |
-| **ASGI** | Asynchronous Server Gateway Interface — standard dla async serwerów Python |
-| **FastAPI** | Framework web oparty o Pydantic + ASGI |
-| **structlog** | Ustrukturyzowane logowanie JSON |
-| **Correlation ID** | Unikalny identyfikator żądania propagowany przez serwisy |
-| **Liveness probe** | K8s/Docker: sprawdzenie, czy proces żyje |
-| **Readiness probe** | K8s/Docker: sprawdzenie, czy serwis jest gotowy przyjmować ruch |
+| **Reverse proxy** | Serwer pośredni przekazujący żądania do właściwych serwerów docelowych (klient nie zna ich adresów) |
+| **Edge service** | Serwis stojący na granicy systemu (internet → wewnętrzna sieć); jedyny wystawiony na świat |
+| **BFF** | Backend for Frontend — serwis zoptymalizowany pod konkretnego klienta (gateway jest BFF dla przeglądarki) |
+| **JWT** | JSON Web Token — podpisany token potwierdzający tożsamość (`header.payload.signature`, base64url) |
+| **RS256** | RSA Signature with SHA-256 — asymetryczny algorytm podpisu JWT (prywatny podpisuje, publiczny weryfikuje) |
+| **JWKS** | JSON Web Key Set — produkcyjny sposób dystrybucji kluczy publicznych (endpoint z kluczami + rotacja; tu: wolumen Docker) |
+| **Header rewriting** | Usuwanie/wstrzykiwanie nagłówków HTTP przez proxy (tu: strip `X-User-ID` + inject po JWT) |
+| **Anti-spoofing** | Ochrona przed podszywaniem tożsamości (klient nie może narzucić `X-User-ID` — gateway czyści) |
+| **Hop-by-hop** | Nagłówki przeznaczone dla jednego "hop" połączenia (`Connection`, `Transfer-Encoding` — nie end-to-end; RFC 2616 §13.5.1) |
+| **Sliding window** | Przesuwne okno czasowe dla rate limitingu („ostatnie N sekund", nie „bieżąca minuta") |
+| **Fixed window** | Sztywne okno (minuta kalendarzowa) — prostsze, niesprawiedliwe o północy okna |
+| **Sorted Set** | Struktura Redis: zbiór elementów posortowanych wg score (tu: member=timestamp-string, score=timestamp) |
+| **Pipeline** | Kolejka komend Redis wysyłanych hurtowo (jeden round-trip zamiast N) |
+| **Transaction (MULTI/EXEC)** | Atomowe wykonanie pipeline (`transaction=True` — nikt nie wchodzi w środek) |
+| **Streaming** | Strumieniowanie danych "na bieżąco" bez buforowania (chunk ~4 KB, nie cały plik w RAM) |
+| **httpx** | Nowoczesny klient HTTP dla Pythona (async, connection pooling, `stream=True`) |
+| **Connection pooling** | Reużywanie otwartych socketów TCP (jeden `AsyncClient` na proces, nie per request) |
+| **ASGI** | Asynchronous Server Gateway Interface — standard dla async serwerów Python (scope, stream, lifespan) |
+| **FastAPI** | Framework web oparty o Pydantic + ASGI (DI przez `Depends`, OpenAPI za darmo) |
+| **Catch-all route** | Jeden endpoint `/{path:path}` łapiący wszystkie ścieżki (tu: cała brama!) |
+| **Longest-prefix match** | Dopasowanie do najdłuższego pasującego prefiksu (jak routing IP; tu: z luką G-1!) |
+| **structlog** | Ustrukturyzowane logowanie JSON (pola zamiast zdań — grep po polach) |
+| **Correlation ID** | Unikalny identyfikator żądania propagowany przez serwisy (`X-Correlation-ID` wte i wewte) |
+| **Liveness probe** | K8s/Docker: sprawdzenie, czy proces żyje (`/health` — restartuj, gdy nie) |
+| **Readiness probe** | K8s/Docker: czy serwis gotowy na ruch (`/ready` — nie ślij, gdy nie; tu: stub!) |
+| **CORS / preflight** | Mechanizm przeglądarki: OPTIONS przed ryzykownym requestem + `Access-Control-Allow-*` (tu: brak — luka G-3!) |
+| **Circuit breaker** | Bezpiecznik: po N błędach upstream odpowiada natychmiast 503 zamiast czekać (tu: brak — FAQ) |
+| **Algorithm confusion** | Atak: podmiana `alg` RS256→HS256 + podpisanie publicznym kluczem jako sekretem (blokuje whitelista `algorithms`) |
+
+> Uwaga: hasła oznaczone „(tu: …)" wiążą pojęcie z konkretnym miejscem w kodzie — glosariusz jest indeksem, nie esejem (eseje są w §6).
 
 ### 12.4 FAQ
 
@@ -2260,7 +2803,7 @@ sequenceDiagram
 
 #### "Co się stanie, gdy Applicant Service nie odpowiada?"
 
-Gateway czeka do timeoutu httpx (30 sekund), potem zwraca 504 Gateway Timeout (httpx rzuca `TimeoutException`). Klient czeka 30s — to długo. Poprawka: niższy timeout per serwis (np. 5s dla auth) + circuit breaker (po N błędach → natychmiastowy 503 bez czekania).
+Gateway czeka do timeoutu httpx (30 sekund), po czym `httpx.TimeoutException` **propaguje się w górę** (kod nie ma `try/except` wokół `forward()`!) → FastAPI zamienia nieobsłużony wyjątek na **500 Internal Server Error** (nie 504! — 504 wymagałoby jawnego złapania timeoutu i mapowania, którego nie ma). Klient czeka 30 s i dostaje 500 — najgorsza kombinacja (długo + nieprecyzyjnie). Poprawka: `try/except TimeoutException → 504 Gateway Timeout` + niższy timeout per serwis (np. 5 s dla auth) + circuit breaker (po N błędach → natychmiastowy 503 bez czekania).
 
 #### "Czy gateway może obsługiwać wiele instancji?"
 
@@ -2279,6 +2822,30 @@ Pojedynczy catch-all endpoint uprostrza kod (jedna logika routing/auth/rate-limi
 #### "Czym się różni `decode_responses=False` w Redis?"
 
 Domyślnie `redis.asyncio` dekoduje odpowiedzi do `str`. `decode_responses=False` zwraca `bytes`. Dla rate limiting:`ZADD` z `str(now)` jako member jest OK; ale `ZCARD` zwraca `int` niezależnie od `decode_responses`. Użycie `False` jest bezpieczniejsze (unika problemów z kodowaniem przy kluczach binsrnych).
+
+#### "Po co gateway w ogóle istnieje? Nie można wołać serwisów wprost?"
+
+Można (technicznie), ale tracisz 5 rzeczy naraz: (1) **jedną powierzchnię ataku** (3 serwisy wystawione = 3× więcej do pilnowania; gateway = 1 punkt z JWT), (2) **centralne czyszczenie tożsamości** (każdy serwis musiałby sam weryfikować JWT + strippować nagłówki — N implementacji = N szans na bug), (3) **wspólny rate limiting** (limity per IP/user w jednym Redisie, nie rozproszone), (4) **stabilny kontrakt URL** (frontend woła `:8000`, a wewnętrzne porty/hosty zmieniają się bez jego wiedzy), (5) **obserwowalność wejścia** (jeden punkt korelacji + logów). Cena: dodatkowy hop sieciowy (~1 ms w Dockerze) + SPOF (pada gateway = pada wszystko — stąd multi-instancja za LB, FAQ wyżej).
+
+#### "Dlaczego modułowe singletony, a nie Depends() jak w loan-app?"
+
+Bo gateway nie ma use case'ów do komponowania per request (4 obiekty na proces, wszystkie współdzielone: trasy, klient HTTP, walidator, limiter). `Depends` budowałby fabryki dla czegoś, co istnieje raz — ceremoniał bez zysku. Singletony + `init_gateway` w lifespan = zero narzutu DI na request. Cena: testy endpointu wymagają grzebania w globalach (dlatego integracji nie ma — §6.12; błędne koło, które trzeba przerwać testem z §9.5).
+
+#### "Co z endpointem `/events` (SSE stub)?"
+
+Dziś: wpis `base_url=""` + gałąź 404 w `proxy_endpoint` (nieosiągalna z powodu G-1/G-2 — patrz §5.4.2!). Etap 4 wymaga: (a) naprawy routingu (G-1/G-2), (b) handlera SSE (`text/event-stream`, heartbeat `: ping` co 15 s, `Last-Event-ID`, initial state z REST), (c) subskrypcji Redis Pub/Sub `loan-status:{applicant_id}`, (d) autoryzacji tokenem w query/cookie (EventSource nie wysyła nagłówków `Authorization`!). Punkt (d) to nowa ścieżka auth w gateway (query-token → ten sam `TokenValidator`) — do zaprojektowania w Etapie 4.
+
+#### "Skąd gateway bierze klucz publiczny i co przy rotacji?"
+
+Z pliku (`jwt_public_key_path`, default `/app/keys/public_key.pem` — montowany wolumenem Docker z Applicant Service; lokalnie `./keys/`). Wczytywany **raz** przy starcie (`init_gateway` → `TokenValidator(settings.jwt_public_key)` — property czyta plik jeden raz!). Konsekwencja: rotacja kluczy (nowa para w Applicant) wymaga **restartu gateway** (stary klucz w pamięci do restartu!). W oknie między rotacją a restartem gateway odrzuca nowe tokeny (401 dla wszystkich!). Produkcja: JWKS (endpoint z kluczami + cache z TTL + `kid` w nagłówku JWT do wyboru klucza) — SPEC §8 to zapowiada („JWKS jako produkcyjny odpowiednik"). MVP: rotacja = skoordynowany restart obu serwisów (compose nie zrobi tego sam przy zmianie pliku — restart ręczny; dopisać do runbooka!).
+
+#### "Dlaczego refresh endpoint nie ma rate limitu?"
+
+`/api/v1/auth/refresh` jest `public=True, rate_limit=False` (tab. §1.2). Rozumowanie autora: refresh token weryfikuje Applicant Service (podpis + baza), nie gateway — limity „powinny być tam, gdzie weryfikacja". Kontrargument: gateway to tańsze miejsce na odcięcie floodu (atakujący zalewający refresh generuje pełne proxy + pracę Applicant za darmo). Brute-force refresh tokena (losowy UUID w payloadzie? nie — refresh to JWT RS256, nie do zgadnięcia) jest nieopłacalny, więc decyzja broni się kryptograficznie — ale flood (DoS, nie łamanie) przechodzi. Średniak: limit luźny (np. 30/min/IP) zamiast zera.
+
+#### "Jak debugować 'działa curl, nie działa aplikacja'?"
+
+Kolejność: (1) `X-Correlation-ID` z odpowiedzi (gateway zwraca!) → grep po logach gateway + serwisów (ta sama nić). (2) Status: 404 na wszystko → G-1 (slash); 404 tylko na documents → G-2; 401 → token (sprawdź `type: access` + `exp`!); 429 → limity (które okno? auth/IP czy loans/user?); 500 po 30 s → upstream timeout (G-4). (3) Bypass-test: curl wprost do serwisu wewnętrznego (z `X-User-ID` ręcznie!) — działa wprost, nie działa przez bramę → wina gateway (routing/nagłówki); nie działa wprost → wina serwisu. Ta checklista to zalążek runbooka (jak w loan-app §12.5).
 
 ---
 
@@ -2300,7 +2867,16 @@ Domyślnie `redis.asyncio` dekoduje odpowiedzi do `str`. `decode_responses=False
 
 8. **Strukturalny logging JSON** — `libs/observability` z `structlog` i `CorrelationIdMiddleware` — spójny format logów przez wszystkie serwisy.
 
-9. **Znane luki do naprawienia:** brak testów integracyjnych, `/ready` bez sprawdzania Redis, Dockerfile bez `crediguard_observability`, rate limiting loans na GET+POST (spec: tylko POST), `path_prefix` z `{id}` nie pasuje, brak Retry-After, Stripe webhook → loan-service (spec: Disbursement).
+9. **Znane luki do naprawienia:** brak testów integracyjnych, `/ready` bez sprawdzania Redis, Dockerfile bez `crediguard_observability`, rate limiting loans na GET+POST (spec: tylko POST), `path_prefix` z `{id}` nie pasuje, brak Retry-After, Stripe webhook → loan-service (spec: Disbursement) — oraz **krytyczne G-1 (404 na wszystko), G-2 (documents do złego serwisu), G-3 (brak CORS), G-4 (timeout → 500)** (§11).
+
+### Ścieżka czytania dla ról (jak w loan-app guide)
+
+- **Laik:** §1 (analogia z recepcją) → §6.1–6.3 (proxy, matching, sliding window z przykładami) → §5.1 (jeden przepływ) → §12.4 FAQ.
+- **Developer (naprawia G-1):** §4.8 `_match_route` → §11 G-1/G-2 (dowody empiryczne) → §9.5 (który test napisać najpierw) → §6.10 (catch-all mechanika).
+- **Reviewer:** §11 (czy PR domyka lukę?) → §7 (czy zmiana dotyka bezpieczeństwa nagłówków?) → §9 (czy test pinuje zachowanie, nie implementację?).
+- **Architekt:** §13 (decyzje) → §10.5/`Protocol` vs loan-app `ABC` (dwa style portów w repo — ujednolicić?) → SPEC ADR (gateway jako BFF vs service mesh).
+
+> Dokument opracowany na podstawie pełnej analizy kodu źródłowego serwisu `services/gateway` **z weryfikacją empiryczną** (matchowanie tras, routing documents/events, test-deps — §11 G-1–G-6). Przy zmianie tabeli tras, nagłówków lub limitów zaktualizuj ten przewodnik razem z kodem (reguła: PR bez testu integracyjnego trasy = odrzuć — G-1 nie może się powtórzyć).
 
 ---
 

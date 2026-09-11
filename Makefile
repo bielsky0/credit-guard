@@ -29,9 +29,11 @@ up: ## TODO(Etap 10): bring up full stack (infra + all services + frontend)
 	@echo "Not implemented yet — lands in Etap 10. Use 'make infra-up' for now."
 	@exit 1
 
-test: ## TODO(Etap 1+): run test suites across services
-	@echo "Not implemented yet — first service tests land in Etap 1."
-	@exit 1
+test: ## Run test suites across services
+	@echo "--- Applicant Service ---"
+	cd services/applicant && PYTHONPATH=. .venv/bin/pytest tests/unit -q
+	@echo "--- Gateway ---"
+	cd services/gateway && .venv/bin/pytest tests/unit -q
 
 train-model: ## TODO(Etap 7): train the credit scoring model
 	@echo "Not implemented yet — lands in Etap 7."

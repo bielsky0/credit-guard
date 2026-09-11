@@ -1,9 +1,9 @@
 [project]
-name = "crediguard-applicant"
+name = "crediguard-loan-application"
 version = "0.1.0"
-description = "Applicant Service - Registration, Login, JWT (RS256)"
+description = "Loan Application Service - Application intake, Transactional Outbox, State Machine"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
@@ -12,12 +12,11 @@ dependencies = [
     "alembic>=1.13.1",
     "pydantic>=2.9.2",
     "pydantic-settings>=2.5.2",
-    "pydantic[email]>=2.9.2",
-    "python-jose[cryptography]>=3.3.0",
-    "argon2-cffi>=23.1.0",
     "structlog>=24.4.0",
     "httpx>=0.27.2",
     "python-multipart>=0.0.9",
+    "aiokafka>=0.10.0",
+    "redis>=5.0.0",
 ]
 
 [project.optional-dependencies]
@@ -31,21 +30,28 @@ dev = [
 ]
 
 [tool.ruff]
-target-version = "py39"
+target-version = "py312"
 line-length = 100
 src = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "C4"]
 ignore = ["B008", "B904", "UP045"]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.12"
 strict = true
 warn_unused_configs = true
 namespace_packages = true
 explicit_package_bases = true
 mypy_path = ["../../../libs/events/src", "../../../libs/observability/src"]
+
+[[tool.mypy.overrides]]
+module = ["aiokafka.*", "crediguard_events.*", "crediguard_observability.*"]
+ignore_missing_imports = true
 
 [build-system]
 requires = ["setuptools>=75.0.0"]
