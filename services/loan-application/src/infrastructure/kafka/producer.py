@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from aiokafka import AIOKafkaProducer
 from crediguard_events import EventEnvelope
+from crediguard_events.loan import (
+    LOAN_APPLICATION_SUBMITTED_V1,
+    LOAN_STATUS_CHANGED_V1,
+    LoanApplicationSubmittedV1,
+    LoanStatusChangedV1,
+)
 from crediguard_observability import get_logger
 from pydantic import BaseModel
 
@@ -13,26 +19,9 @@ from src.infrastructure.persistence.models import OutboxEventModel
 logger = get_logger()
 
 
-class LoanApplicationSubmittedV1(BaseModel):
-    loan_id: UUID
-    applicant_id: UUID
-    amount: str
-    term_months: int
-    monthly_income: str
-    applicant_age: int
-
-
-class LoanStatusChangedV1(BaseModel):
-    loan_id: UUID
-    applicant_id: UUID
-    old_status: str
-    new_status: str
-    decision_reasons: list[str] | None = None
-
-
 EVENT_SCHEMAS: dict[str, type[BaseModel]] = {
-    "loan.application.submitted.v1": LoanApplicationSubmittedV1,
-    "loan.status.changed.v1": LoanStatusChangedV1,
+    LOAN_APPLICATION_SUBMITTED_V1: LoanApplicationSubmittedV1,
+    LOAN_STATUS_CHANGED_V1: LoanStatusChangedV1,
 }
 
 
