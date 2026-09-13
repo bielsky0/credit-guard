@@ -19,7 +19,15 @@ import httpx
 
 # Headers set/controlled exclusively by the gateway — removed from any client
 # request before forwarding.
-_STRIPPED_HEADERS = frozenset({"x-user-id", "x-user-roles", "authorization", "x-correlation-id"})
+_STRIPPED_HEADERS = frozenset(
+    {
+        "x-user-id",
+        "x-user-roles",
+        "authorization",
+        "x-correlation-id",
+        "cookie",
+    }
+)
 
 # Headers the gateway never lets through from the client (hop-by-hop / security).
 _BLOCKED_HEADERS = frozenset(

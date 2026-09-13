@@ -42,6 +42,10 @@ namespace_packages = true
 explicit_package_bases = true
 mypy_path = ["../../../libs/observability/src", "../../../libs/events/src"]
 
+[[tool.mypy.overrides]]
+module = ["crediguard_observability.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
