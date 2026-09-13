@@ -152,7 +152,7 @@ Jeden `POST` zostawia po sobie **trzy trwałe ślady** (1 wiersz + 2 wiersze out
 2. **Strażnik spójności.** Maszyna stanów egzekwowana w `domain` (nie w API, nie w bazie) — nielegalne przejście rzuca `InvalidStatusTransition`, zanim cokolwiek dotknie bazę.
 3. **Lekcja niezawodności.** Transactional Outbox pokazuje różnicę między „działa na moim komputerze" a „nie gubi zdarzeń, gdy Kafka padnie": zapis wniosku i zdarzeń to **jedna transakcja SQL**; worker dowozi zdarzenia później (semantyka *at-least-once*, duplikaty łapią konsumenci).
 4. **Wzorzec Hexagonal/Clean.** Porty (`LoanApplicationRepository`, `OutboxRepository`, `IdempotencyStore`) + adaptery (SQLAlchemy, Redis) + DI przez FastAPI `Depends` — ten sam szablon co Applicant Service, więc zespół kopiuje sprawdzony układ.
-5. **Węzeł przyszłych przepływów.** Dziś pętla jest otwarta (konsumenci z Etapów 6–8 jeszcze nie istnieją), ale tabele `processed_events`, schematy `EVENT_SCHEMAS` i maszyna stanów są już przygotowane na ich podłączenie (patrz §12).
+5. **Węzeł przyszłych przepływów.** Pętla częściowo domknięta: od Etapu 4 pierwszy konsument (`notification-service`) czyta `loan.status.changed.v1` (most Kafka→Redis→SSE — pełna historia w `docs/notification-service-guide.md`). Konsumenci biznesowi z Etapów 6–8 (document, underwriting, disbursement) jeszcze nie istnieją, ale tabele `processed_events` i maszyna stanów są już przygotowane na ich podłączenie (patrz §12).
 
 ### 1.4 Czego ten serwis NIE robi
 
@@ -1273,6 +1273,8 @@ class CreateLoanApplicationUseCase:
 - **Payload `submitted.v1`:** pełne dane wniosku (konsument Document nie musi pytać bazy Loan App — event jest samowystarczalny; to jest „fat event", nie „thin notification with callback"). UUID i Decimal jako `str` (JSON nie zna ani UUID, ani Decimal — string jest dokładny; float straciłby grosze). `term_months`/`applicant_age` jako int (JSON zna inty).
 - **Typ eventu jako literał stringowy** `"loan.application.submitted.v1"` (nie stała!). Dwa użycia w kodzie (tu i w `EVENT_SCHEMAS` workera) — literówka rozjechałaby produkcję z konsumpcją (worker: „unknown event type, skipping"). Kandydat na współdzieloną stałą w `libs/events` (patrz §11). Sufiks `.v1` = jawne wersjonowanie kontraktu (SPEC §5.1).
 
+> **Aktualizacja (Etap 4 — zrealizowane):** stałe powstały (`libs/events/loan.py`: `LOAN_APPLICATION_SUBMITTED_V1`, `LOAN_STATUS_CHANGED_V1`), a worker importuje schematy z `libs` zamiast definiować lokalnie (§4.11 poniżej). Use case nadal pisze literał w payloadzie outboxa — pełne wyczyszczenie (import stałych także w use case) to 5-minutowy refactor `refactor(loan-application)`, odnotowany w notification guide §11 luka #4.
+
 ```python
         status_event_payload = {
             "loan_id": str(loan.id),
@@ -1807,25 +1809,63 @@ class SQLAlchemyProcessedEventRepository(ProcessedEventRepository):
 
 ### 4.11 Plik: `src/infrastructure/kafka/producer.py` (173 linie)
 
-**Cel:** schematy payloadów eventów + `OutboxWorker` — jedyny kontakt serwisu z Kafką, i to tylko jako **producent** (konsumentów brak; będą w Etapach 6–8). Plik łączy dwie role: rejestr kontraktów (`EVENT_SCHEMAS`) i mechanikę dowozu (worker). Importuje modele SQLAlchemy wprost (`OutboxEventModel`) — pragmatyczne obejście portu `OutboxRepository` (patrz §2.1 i §11 luka #13).
+**Cel:** schematy payloadów eventów + `OutboxWorker` — jedyny kontakt serwisu z Kafką, i to tylko jako **producent** (od Etapu 4 pierwszy konsument — `notification-service` — czyta `loan.status.changed.v1`; konsumenci biznesowi przyjdą w Etapach 6–8). Plik łączy dwie role: rejestr kontraktów (`EVENT_SCHEMAS`) i mechanikę dowozu (worker). Importuje modele SQLAlchemy wprost (`OutboxEventModel`) — pragmatyczne obejście portu `OutboxRepository` (patrz §2.1 i §11 luka #13).
+
+> **Aktualizacja (Etap 4):** lokalne klasy `LoanApplicationSubmittedV1` / `LoanStatusChangedV1` wyjechały do `libs/events/loan.py` (single source of truth — pełna analiza kontraktu w `docs/notification-service-guide.md` §4.1). Poniższe bloki 1–2 opisują stan po przenosinach; historyczne cytaty z lokalnymi klasami zachowano w przypisach.
+
+#### Blok 1: importy (stan po Etapie 4)
+
+```python
+from aiokafka import AIOKafkaProducer
+from crediguard_events import EventEnvelope
+from crediguard_events.loan import (
+    LOAN_APPLICATION_SUBMITTED_V1,
+    LOAN_STATUS_CHANGED_V1,
+    LoanApplicationSubmittedV1,
+    LoanStatusChangedV1,
+)
+from crediguard_observability import get_logger
+from pydantic import BaseModel
+
+from src.infrastructure.persistence.models import OutboxEventModel
+
+logger = get_logger()
+
+
+EVENT_SCHEMAS: dict[str, type[BaseModel]] = {
+    LOAN_APPLICATION_SUBMITTED_V1: LoanApplicationSubmittedV1,
+    LOAN_STATUS_CHANGED_V1: LoanStatusChangedV1,
+}
+```
+
+- **`from crediguard_events.loan import ...`** — cztery symbole: dwie stałe typów + dwie klasy payloadów. Granica serwisu przesunięta: kontrakt żyje w `libs`, serwis go konsumuje (jak `notification`). Zmiana pola payloadu to jeden PR w `libs/events` + bump w obu serwisach (monorepo robi to atomowo — SPEC §10).
+- **`from uuid import uuid4`** (bez `UUID`!): po wyjeździe klas `UUID` nie jest już potrzebny w tym pliku (ruff F401 wyłapałby wisielec — wyczyszczono przy refaktorze). Został `uuid4` (generowanie `correlation_id` w `_publish_event`). Importy kłamią rzadziej niż komentarze — martwy import to martwe kłamstwo („używam UUID", a nie używa).
+- **`EVENT_SCHEMAS` na stałych, nie literałach**: klucze `LOAN_*_V1` (importowane, nie wpisane). Literówka w nazwie typu jest teraz niemożliwa fizycznie (błędna nazwa = `ImportError` przy starcie, nie cichy skip w runtime!). To jest różnica między „fail-fast przy imporcie" a „fail-silent w pętli" — najcenniejszy zysk przenosin.
+- Reszta bloku bez zmian (aiokafka-producent, `EventEnvelope`, logger, `OutboxEventModel` wprost — patrz oryginalna analiza poniżej).
 
 #### Blok 1: importy
 
 ```python
-"""Kafka producer with Transactional Outbox worker."""
-
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from aiokafka import AIOKafkaProducer
 from crediguard_events import EventEnvelope
+from crediguard_events.loan import (
+    LOAN_APPLICATION_SUBMITTED_V1,
+    LOAN_STATUS_CHANGED_V1,
+    LoanApplicationSubmittedV1,
+    LoanStatusChangedV1,
+)
 from crediguard_observability import get_logger
 from pydantic import BaseModel
 
 from src.infrastructure.persistence.models import OutboxEventModel
 ```
+
+> **Uwaga do cytatu (Etap 4):** w pliku nie ma już `from uuid import UUID` (klasy wyjechały do `libs` — ruff F401 pilnuje) ani lokalnych klas (patrz Blok 1 powyżej i Blok 2). Reszta analizy importów poniżej bez zmian.
 
 - **Linia `from aiokafka import AIOKafkaProducer`:** asynchroniczny producent Kafki (SPEC §3: „aiokafka — spójny z event loopem FastAPI"). Dla laika: zwykły `kafka-python` blokowałby wątek na czas wysyłki; `AIOKafkaProducer` zawiesza coroutine (`await send_and_wait`) i oddaje loop innym requestom. Alternatywa `confluent-kafka` (szybsza, librdkafka w C) jest synchroniczna — wymagałaby `run_in_executor` i komplikowała lifespan.
 - **Linia `from crediguard_events import EventEnvelope`:** koperta ze współdzielonego `libs/events` (jedno źródło prawdy kontraktu w monorepo — zmiana koperty to jeden PR we wszystkich serwisach, SPEC §10: uzasadnienie monorepo).
@@ -1833,7 +1873,11 @@ from src.infrastructure.persistence.models import OutboxEventModel
 - **Linia `from pydantic import BaseModel`:** schematy payloadów jako modele Pydantic (walidacja przed wysyłką — zły payload nie opuszcza procesu).
 - **Linia `from ...models import OutboxEventModel`:** worker czyta wprost modele, nie port — skrót Etapu 3 (worker żyje poza cyklem request/response, więc DI z `dependencies.py` go nie obejmuje). Cena: duplikacja zapytania `get_pending` (worker ma własną kopię) i zależność infrastructure→infrastructure zamiast infrastructure→application.
 
-#### Blok 2: schematy payloadów i rejestr
+#### Blok 2: schematy payloadów i rejestr (stan po Etapie 4 — klasy w `libs/events`)
+
+Lokalny blok z klasami `LoanApplicationSubmittedV1` / `LoanStatusChangedV1` (opisany poniżej w wersji historycznej) **wyjechał** do `libs/events/loan.py`. W pliku zostały tylko importy (patrz Blok 1 powyżej) i rejestr na stałych. Pełna analiza kontraktu — pola, `amount: str` (nie Decimal!), statusy-stringi (nie enum!), `decision_reasons` jako trójstan — w `docs/notification-service-guide.md` §4.1.
+
+> **Wersja historyczna (przed Etapem 4, zachowana jako dokumentacja długu, który spłacono):**
 
 ```python
 class LoanApplicationSubmittedV1(BaseModel):
@@ -1867,6 +1911,8 @@ EVENT_SCHEMAS: dict[str, type[BaseModel]] = {
 - **Linia `decision_reasons ... = None`:** default None (event bez uzasadnienia to legalny stan początkowy). Klucz zawsze obecny (stabilny schemat — konsument nie rozgałęzia „brak klucza" vs „null").
 - **Linia `EVENT_SCHEMAS`:** rejestr „typ → walidator". Adnotacja `dict[str, type[BaseModel]]` (wartości to klasy, nie instancje — `type[...]`). Nieznany typ w bazie → `None` z `.get` → warning + skip (nie crash workera — jeden zły wiersz nie zatrzymuje kolejki; patrz `_publish_event`). To jest fail-open dla robusności kolejki (przeciwieństwo fail-fast w domenie — różne miejsca, różne filozofie).
 - **Luka spójności:** literały `"loan.application.submitted.v1"` występują tu i w use case (dwa miejsca, zero wspólnej stałej). Literówka w jednym = worker skipuje eventy use case'a na zawsze (cicha śmierć — tylko warning w logach). Kandydat na stałe w `libs/events` (§11).
+
+> **Aktualizacja (Etap 4 — luka spłacona w połowie):** rejestr workera używa już stałych z `libs/events` (fail-fast przy imporcie zamiast fail-silent w pętli). Zostały literały w use case (`create_loan_application.py`) — 5-minutowy refactor, odnotowany w notification guide §11 luka #4.
 
 #### Blok 3: `OutboxWorker.__init__`, `start`, `stop`
 

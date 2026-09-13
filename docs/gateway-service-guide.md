@@ -61,10 +61,11 @@ Gateway Service jest **bezstanowy (stateless)** — z definicji **nie posiada w�
 | `/api/v1/loans` | GET/POST | `loan-application:8002` | ✅ JWT | ✅ 3/10min/użytkownik |
 | `/api/v1/loans/{id}` | GET/PUT... | `loan-application:8002` | ✅ JWT | ❌ |
 | `/api/v1/loans/{id}/documents` | GET/POST | `document:8003` | ✅ JWT | ❌ |
-| `/api/v1/loans/{id}/events` | (SSE) | **nie proxy** (Etap 4) | ✅ JWT | ❌ |
+| `/api/v1/loans/{id}/events` | GET (SSE) | **nie proxy — lokalny `sse_router` (Etap 4)** | ✅ cookie `cg_access` (fallback: Bearer) | ❌ |
+| `/api/v1/auth/logout` | POST | **lokalny (Etap 4, nie w tabeli tras)** | ✅ cookie (czyści oba) | ❌ |
 | `/api/v1/webhooks/stripe` | POST | `loan-application:8002` | ❌ publiczny (webhook) | ❌ |
 
-> **Uwaga do tabeli (po weryfikacji kodu, §11 G-1/G-2):** wiersze z literalnym `{id}` (`/loans/{id}`, `/documents`, `/events`) w praktyce **nie matchują** (niedostępne routingowo), a bez naprawy G-1 cała tabela zwraca 404. Tabela opisuje **intencję** (`routing.py`), nie działanie. Trzymaj ją zsynchronizowaną z testem integracyjnym z §9.5 (gdy powstanie).
+> **Aktualizacja (Etap 4):** wiersz `/events` nie jest już stubem — obsługuje go `src/api/sse.py` (pełna analiza protokołu w `docs/notification-service-guide.md` §4.5/§4.8, brzeg HTTP w §4.11 poniżej). Nota G-1/G-2 poniżej jest **nieaktualna**: `_match_route` naprawiono (normalizacja wiodącego `/` — commit `fix(gateway)` z Etapu 4 + `tests/unit/test_routing_match.py`), cała tabela działa. Wiersze z literalnym `{id}` w tabeli tras (`/loans/{id}`, `/documents`) nadal nie matchują jako osobne wpisy (longest-prefix łapie je pod `/api/v1/loans`) — opisują intencję, nie mechanikę.
 
 #### Przykład: co gateway robi z requestem (ślad nagłówków)
 
@@ -214,30 +215,36 @@ services/gateway/
 ├── pyproject.toml                    # Metadane pakietu, zależności, konfiguracja ruff/mypy
 ├── src/
 │   ├── __init__.py                   # (pusty) — pakiet
-│   ├── main.py                       # Wejście aplikacji FastAPI (lifespan, health)
+│   ├── main.py                       # Wejście FastAPI (lifespan, CORS, SSE+proxy, health)
 │   ├── api/
 │   │   ├── __init__.py               # (pusty)
-│   │   ├── proxy_router.py           # Catch-all reverse proxy endpoint (sedno!)
+│   │   ├── proxy_router.py           # Catch-all reverse proxy + translacja cookie-auth (Etap 4!)
+│   │   ├── sse.py                    # Endpoint SSE (Etap 4 — protokół w notification guide)
 │   │   ├── routes.py                 # Klasa Route (dataclass)
 │   │   └── routing.py                # Budowa tabeli tras ze Settings
 │   ├── core/
 │   │   ├── __init__.py               # (pusty)
-│   │   └── config.py                 # Settings (pydantic-settings)
+│   │   └── config.py                 # Settings (pydantic-settings + pola cookie/CORS z Etapu 4)
 │   ├── infrastructure/
 │   │   ├── __init__.py               # (pusty)
 │   │   ├── rate_limit.py             # Sliding-window rate limiter (Redis)
 │   │   └── redis.py                  # Cykl życia klienta Redis
 │   └── services/
 │       ├── __init__.py               # (pusty)
+│       ├── cookies.py                # HttpOnly cookie-auth (Etap 4 — §4.10)
 │       ├── proxy.py                  # Reverse proxy (httpx) + przepisywanie nagłówków
-│       └── token.py                  # Walidacja JWT (RS256, klucz publiczny)
+│       └── token.py                  # Walidacja JWT (RS256 + metody cookie z Etapu 4)
 └── tests/
     ├── __init__.py                   # (pusty)
     ├── unit/
     │   ├── __init__.py               # (pusty)
+    │   ├── test_cookies.py           # Cookie-auth: nagłówki, sanitacja, logout (Etap 4)
     │   ├── test_proxy_headers.py     # Testy przepisywania nagłówków
     │   ├── test_rate_limit.py        # Testy rate limitera (FakeRedis)
-    │   └── test_token.py             # Testy walidacji JWT
+    │   ├── test_routing_match.py     # Regresja na fix G-1 (Etap 4)
+    │   ├── test_sse.py               # Ramki SSE: format, kroki, decision (Etap 4)
+    │   ├── test_token.py             # Testy walidacji JWT (Bearer)
+    │   └── test_token_cookie.py      # Walidacja z cookie + RSA w teście (Etap 4)
     └── integration/
         └── __init__.py               # (pusty; brak testów integracyjnych na razie)
 ```
@@ -833,7 +840,7 @@ def build_routes(settings: Settings) -> list[Route]:
         ),
 ```
 
-8. **`/api/v1/loans/{id}/events`** — `base_url=""` → **nie proxy**. Zwraca 404. To stub dla przyszłego endpointu SSE (Server-Sent Events) w Etap 4: strumieniowe powiadomienia o statusie wniosku przez Redis Pub/Sub. Obecnie niezaimplementowany.
+8. **`/api/v1/loans/{id}/events`** — `base_url=""` → **nie proxy**. Historycznie zwracał 404 (stub SSE). **Zrealizowane w Etapie 4:** request nigdy tu nie dociera (osobny `sse_router` rejestrowany przed catch-all w `main.py` — §4.11); gałąź `base_url == ""` została jako strażnik przyszłych stubów. Pełna analiza protokołu: `docs/notification-service-guide.md` §4.5/§4.8.
 
 ```python
         Route(
@@ -1389,6 +1396,29 @@ async def ready() -> dict[str, str]:
 - **`/health`** — liveness probe (k8s/Docker). Zawsze zwraca `200 OK`. Sprawdza: "czy proces żyje?" — niezależnie od Redis, wewnętrznych serwisów itd.
 - **`/ready`** — readiness probe. Zwraca `200 OK`. **Uwaga:** nie sprawdza realnej gotowości (nie pinguje Redis, nie sprawdza wewnętrznych serwisów). Spec §9.3 opisuje readiness, który powinien sprawdzać DB/Kafka/Redis — ale w obecnej implementacji to uproszczenie. Zob. sekcja 11.
 
+### 4.10 Plik: `src/services/cookies.py` (Etap 4 — HttpOnly cookie-auth)
+
+**Cel:** translacja brzegowa — upstream Applicant zwraca goły JSON z tokenami, gateway zamienia go na dwa HttpOnly cookie i czyści body z sekretów. Surowe JWT nigdy nie docierają do JS przeglądarki.
+
+- **Dwa ciasteczka, dwa reżimy:** `cg_access` (Path=`/`, 15 min — leci do API i SSE) i `cg_refresh` (Path=`/api/v1/auth/refresh`, 7 dni — nigdy nie leci do SSE ani loan-endpointów). Scoping `Path` to mechanizm, nie ozdobnik: zmiana Path refresha na `/` wysłałaby długowieczny sekret do każdego endpointu.
+- **`sanitize_auth_body(body) -> (safe, access, refresh)`** — whitelist, nie passthrough: safe body zawiera tylko `token_type` + `expires_in`. Nowe pole w `TokenResponse` upstreamu NIE wycieknie samo (trzeba je dopisać do `safe` świadomie). Trzy strażnicy (zły JSON / nie-słownik / brak tokenów) z jednym komunikatem (anty-enumeracja kształtu upstreamu, jak `InvalidCredentials` w applicancie).
+- **`build_cookie_auth_response` / `build_logout_response`** — dwa `headers.append("Set-Cookie", ...)` (osobne linie! RFC 6265 zabrania łączenia przecinkiem); status z upstreamu przekazywany (201 z register = 201 do klienta); logout to lustro z `Max-Age=0` (ten sam `Path` — czyszczenie z innym Path nie zadziała!).
+- **`build_refresh_body_from_cookie`** — przeglądarka mówi cookie, Applicant mówi JSON; to zdanie je tłumaczy (refresh-only-cookie: §4.11).
+- **Flaga `Secure`** z `settings.cookie_secure` (`False` lokalnie — przeglądarka odrzuciłaby `Secure` na `http://localhost` po cichu; `True` na prod-HTTPS).
+- Pełna analiza linijka-po-linijce (w tym mapa pokrycia testami `test_cookies.py` i wykryte luki: nietestowane `Max-Age` refresh, brak asercji na Path przy czyszczeniu, zero testów builderów `build_*_response`): `docs/notification-service-guide.md` §4.9.
+
+### 4.11 Etap 4 w gateway: SSE + cookie-fallback + CORS (przegląd zmian)
+
+**Cel sekcji:** zebrać w jednym miejscu wszystko, co Etap 4 zmienił w gateway (poza `cookies.py` z §4.10). Protokół SSE (ramki, resume, heartbeat) opisuje `docs/notification-service-guide.md` §4.5/§4.8 — tu tylko brzeg.
+
+- **`src/api/sse.py` (nowy, 248 linii):** `GET /api/v1/loans/{loan_id}/events` (`response_model=None` — FastAPI nie modeluje unii Response). Kolejność strażników: 503 (lifespan) → 403 (Origin/Referer — `SameSite=Lax` + check domyka CSRF) → 401 (cookie `cg_access` first, Bearer fallback) → 404 (ownership przez `_fetch_loan` z `X-User-ID`; 404 zamiast 403 — anty-enumeracja). `event_stream`: initial-state z REST (spóźniony nie wisi) → subscribe `loan-status:{applicant_id}` → filtr `loan_id` → resume po `Last-Event-ID` → heartbeat `: ping` co 15 s → terminal-break. Znane długi: `startswith` na Origin (prefix-atak — notification guide §11 luka #10), osobny `httpx.AsyncClient` na strumień (luka #9), stub `_disconnect_hint`.
+- **`src/services/token.py`:** rozpad `validate(authorization)` na `validate_token` (serce bez transportu: podpis, `exp`, `type == "access"`, `UUID(sub)`) + wrappery `validate` (Bearer, kompatybilność z Etapem 2) i `validate_cookie` (nowość). Jeden punkt weryfikacji podpisu — bez dwuklasowości bezpieczeństwa.
+- **`src/services/proxy.py`:** `cookie` w `_STRIPPED_HEADERS` (sekrety nie jadą w głąb) + filtr `set-cookie` z odpowiedzi upstreamu (obce ciasteczka nie wracają do przeglądarki).
+- **`src/api/proxy_router.py`:** logout przed matchowaniem (endpoint lokalny, nie w tabeli — pierwsza wersja zwracała 404!); refresh-only-cookie (gateway wstrzykuje `{"refresh_token"}` z cookie do body upstreamu); buforowanie małego `TokenResponse` → `Set-Cookie` + sanitacja (sukces z nieparsowalnym body → 502, nie 500); błędy upstreamu 1:1; cookie-fallback na trasach chronionych (Bearer first). **Fix krytyczny przy okazji:** `_match_route` normalizuje wiodący `/` (G-1 — cały proxy zwracał 404 od Etapu 2!) + `tests/unit/test_routing_match.py`.
+- **`src/core/config.py`:** 5 nowych pól (`frontend_url`, `cookie_secure`, `access/refresh_cookie_name`, `access/refresh_cookie_max_age` — parzystość z czasami JWT w applicancie).
+- **`src/main.py`:** `CORSMiddleware` (jeden origin + `allow_credentials`, `expose_headers=["X-Correlation-ID"]`, kolejność middleware jako stos!) + rejestracja `sse_router` PRZED catch-all proxy (inaczej catch-all połknąłby `/events`).
+- **Testy (4 nowe pliki):** `test_cookies.py` (nie-wyciek, scoping, cykl sekretu), `test_token_cookie.py` (RSA-2048 generowane w teście, negatywy, regresja Bearera), `test_sse.py` (format drutu, mapa kroków, decision), `test_routing_match.py` (strażnik fixa G-1). Pełne analizy: notification guide §9.4.
+
 ---
 
 ## 5. Ścieżki wywołań endpointów
@@ -1672,7 +1702,7 @@ allowed = await _limiter.allowed("loans:550e8400-...", 3, 600)
 
 ### 5.4 Scenariusze błędów
 
-#### 5.4.1 Nieznana ścieżka → 404 (poprawny wynik, zła przyczyna!)
+#### 5.4.1 Nieznana ścieżka → 404 (ROZWIĄZANE: G-1 naprawiony w Etapie 4)
 
 ```bash
 curl http://localhost:8000/api/v1/unknown
@@ -1680,9 +1710,9 @@ curl http://localhost:8000/api/v1/unknown
 
 - `_match_route("api/v1/unknown")` → brak kandydatów → `None`.
 - Zwraca `JSONResponse({"detail": "Not Found"}, status_code=404)`.
-- **Uwaga (luka G-1, §11):** 404 jest tu poprawne, ale przyczyna opisana wyżej myli — matchowanie nie działa dla **żadnej** ścieżki (brak wiodącego `/` po stronie Starlette), więc ten sam 404 dostaje też poprawny `/api/v1/auth/register`. Test „nieznana ścieżka → 404" przechodzi z fałszywego powodu (false positive!).
+- **Aktualizacja (Etap 4):** historycznie ten sam 404 dostawała KAŻDA ścieżka (luka G-1: brak wiodącego `/` po stronie Starlette — §11). Naprawiono normalizacją w `_match_route` + testem `test_routing_match.py`. Od Etapu 4 404 oznacza naprawdę „nieznana ścieżka" (test `test_unknown_path_returns_none`). Poniższy akapit zostaje jako dokumentacja znalezionego false positive.
 
-#### 5.4.2 SSE endpoint (niezaimplementowany) → 404 (dwoma różnymi drogami)
+#### 5.4.2 SSE endpoint (ZREALIZOWANE w Etapie 4 — historia stubu poniżej)
 
 ```bash
 curl http://localhost:8000/api/v1/loans/123/events \
@@ -1692,6 +1722,8 @@ curl http://localhost:8000/api/v1/loans/123/events \
 - **Droga 1 (realna, przez Starlette):** catch-all `/{path:path}` daje `path = "api/v1/loans/123/events"` (BEZ wiodącego `/`!). `_match_route` porównuje z prefixami ZE slashem → brak kandydatów → `None` → 404 (luka krytyczna G-1, §11).
 - **Droga 2 (hipotetyczna, gdyby slash był):** nawet z wiodącym `/` kandydatem byłby `/api/v1/loans` (prefix + `/` pasuje!), a NIE literalny `/api/v1/loans/{id}/events` (ten string nie występuje w realnych ścieżkach — §11 luka `path_prefix` z `{id}`). Gałąź `route.base_url == ""` (SSE stub) jest więc **nieosiągalna** — request poszedłby proxy do `loan-application:8002` zamiast 404!
 - Wniosek: stub SSE nie działa ani jako 404 (realnie: 404, ale z powodu G-1, nie stubu), ani jako przyszły punkt zaczepienia (niedostępny routing). Etap 4 musi naprawić oba poziomy. W przyszłości (Etap 4) zostanie tu zaimplementowane SSE.
+
+> **Aktualizacja (Etap 4 — zrealizowane):** oba poziomy naprawione: (1) `_match_route` normalizuje wiodący `/` (fix G-1); (2) `/events` obsługuje osobny `sse_router` (`src/api/sse.py`) rejestrowany PRZED catch-all w `main.py` — gałąź `base_url == ""` w tabeli jest już nieosiągalna dla tej ścieżki (została jako strażnik przyszłych stubów). Weryfikacja: `curl` bez cookie → 401 z handlera SSE (nie 404 z proxy!), obcy `Origin` → 403. Pełna analiza protokołu: `docs/notification-service-guide.md` §4.5/§4.8 (§4.11 powyżej dla brzegu).
 
 #### 5.4.3 Brak autoryzacji → 401
 
@@ -1725,7 +1757,7 @@ curl http://localhost:8000/api/v1/me
 | 200/201/202 | serwis wewnętrzny (passthrough!) | sukces upstream | body serwisu | nie (sukces) |
 | 400 | gateway (`Rate limit not applicable`) | route loans bez `applicant_id` (praktycznie niemożliwe — wymaga auth) | `{"detail": ...}` | nie (bug/config) |
 | 401 | gateway (JWT) | brak/zły/wygasły token, refresh zamiast access | `{"detail": "Unauthorized"}` + `WWW-Authenticate: Bearer` | tak — po odświeżeniu tokena |
-| 404 | gateway (routing) | brak route / stub SSE... **oraz każdy request przy luce G-1!** | `{"detail": "Not Found"}` | nie (ale przy G-1: czekaj na fix, nie na siebie) |
+| 404 | gateway (routing) | brak route / stub SSE (historycznie: KAŻDY request przy luce G-1 — naprawione w Etapie 4!) | `{"detail": "Not Found"}` | nie |
 | 405 | Starlette | OPTIONS / nieobsługiwana metoda (preflight CORS!) | generyczne | nie (luka G-3) |
 | 422 | serwis wewnętrzny (passthrough) | zły JSON (Pydantic w serwisie) | `{"detail": [...]}` | tak — po poprawie body |
 | 429 | gateway (limiter) | >5/min/IP (auth) lub >3/10min/user (loans) | `{"detail": "Rate limit exceeded"}` (bez `Retry-After`!) | tak — po oknie (60 s / 600 s) |
@@ -2039,6 +2071,10 @@ uvicorn src.main:app --reload --port 8000
 | `REDIS_URL` | `redis://localhost:6380/0` | Adres Redis |
 | `RATE_LIMIT_AUTH_PER_MINUTE` | `5` | Limit: auth req/min per IP |
 | `RATE_LIMIT_LOANS_PER_10_MIN` | `3` | Limit: loans req/10 min per user |
+| `FRONTEND_URL` | `http://localhost:3000` | Jedyny origin CORS z credentials (Etap 4; nigdy `*`) |
+| `COOKIE_SECURE` | `false` | Flaga `Secure` na cookie (Etap 4; `false` lokalnie na HTTP, `true` na prod-HTTPS) |
+| `ACCESS_COOKIE_NAME` | `cg_access` | Nazwa cookie access (Etap 4) |
+| `REFRESH_COOKIE_NAME` | `cg_refresh` | Nazwa cookie refresh (Etap 4) |
 
 ### 8.3 Analiza Dockerfile
 
@@ -2466,7 +2502,7 @@ async def test_different_keys_do_not_interfere() -> None:
 - **Testy asynchroniczne** (jedyne `async def` w testach gateway — limiter jest async, bo prawdziwy Redis to I/O; fake też async dla zgodności interfejsu).
 - **Czego brak:** test wygasania okna (time travel — `time.time` nie mockowany; okno 60 s nieprzetestowane: czy stare wpisy wypadają? Fake wspiera (`zrem` z zakresem!), ale żaden test nie cofa zegara. Do przetestowania: monkeypatch `time.time` + dwa ticki), test `expire` (TTL klucza — fake zwraca 1.0 i nic nie robi; wygaśnięcie klucza nieprzetestowane nigdzie!), test współbieżności (dwa taski naraz — atomowość pipeline; wymaga prawdziwego Redis).
 
-### 9.5 Luka: brak testów integracyjnych (krytyczna)
+### 9.5 Luka: brak testów integracyjnych (częściowo zasypana w Etapie 4)
 
 `tests/integration/` zawiera tylko `__init__.py`. Niepokryte (a krytyczne dla bramy!):
 
@@ -2474,6 +2510,8 @@ async def test_different_keys_do_not_interfere() -> None:
 - **Ścieżki 401/404/429** przez `proxy_endpoint` (TestClient + mock `ProxyService.forward` + FakeRedis): dziś logika statusów (503/404/401/400/429) nieprzetestowana wcale (unit testuje składowe, nie orkiestrację!).
 - **Deviacje routingu** (documents → zły serwis, events → proxy zamiast stub — §11 G-2): test `POST /api/v1/loans/123/documents` z mockiem httpx pokazałby zły `base_url` natychmiast.
 - **Plan:** `pytest-httpx` (już w dev-deps! — wreszcie użycie) do mockowania transportu + `httpx.ASGITransport`/`TestClient` do wołania app. Najpierw test G-1 (czerwony!), potem fix kodu (osobny PR — ten guide kodu nie rusza).
+
+> **Aktualizacja (Etap 4 — częściowo zrealizowane):** powstał `tests/unit/test_routing_match.py` (3 testy na `_match_route`: bez slasha, longest-prefix, nieznana → None) — zamraża fix G-1, ale to nadal unit prywatnej funkcji, nie test ścieżki. Smoke-testy TestClient (logout 200, SSE/refresh bez cookie 401, obcy Origin 403) wykonano ad-hoc przy implementacji, nie jako stałe testy. Nadal brak: pełny test integracyjny ścieżki (request → match → forward z mock-upstreamem) oraz test translacji cookie z mockiem applicanta (luka pokrycia `build_*_response` — notification guide §9.4).
 
 ---
 
@@ -2526,19 +2564,21 @@ Gateway używa `stream=True` w httpx + `StreamingResponse` w FastAPI. Nie buforu
 
 | Element | Spec § | Kod | Status |
 |---------|--------|-----|--------|
-| SSE endpoint `/loans/{id}/events` | §4.1: strumieniowe powiadomienia | `base_url=""` → 404 | Stub (Etap 4) |
-| Rate limit loans: tylko POST | §8: 3/10 min na POST | Limit na WSZYSTKIE metody `/loans` | Deviation |
-| Stripe webhook → Disbursement | §4.1: webhook do Disbursement | Proxyje do `loan_service_url` | Deviation |
-| `/ready` sprawdza Redis | §9.3: readiness = DB/Kafka/Redis | Zawsze 200 | Uproszczenie |
-| Dockerfile: libs/observability | — | Nie skopiowany | Bug |
-| `path_prefix` z `{id}` | — | Dosłowny string, nie pattern | Bug |
-| Brak Retry-After w 429 | HTTP RFC 7231 | Brak nagłówka | Missing feature |
-| **G-1: `_match_route` nigdy nie matchuje (wiodący `/`)** | — | Każde żądanie → 404 | **Bug krytyczny (zweryfikowany empirycznie)** |
-| **G-2: documents proxyjowane do złego serwisu** | §4.1: documents → Document | `/api/v1/loans/*` łapie wszystko → loan-application:8002 | **Bug krytyczny** |
-| **G-3: brak CORS + brak OPTIONS** | §8: CORS tylko origin frontendu | Brak `CORSMiddleware`, brak OPTIONS w methods | Deviation (frontend z przeglądarki nie zadzwoni) |
-| **G-4: timeout upstream → 500 zamiast 504** | — | Brak `try/except` wokół `forward()` | Bug (30 s czekania + zły kod) |
-| **G-5: `cryptography` niejawną zależnością testów** | — | Import wprost w teście, tylko transitive via `python-jose[cryptography]` | Dług higieniczny |
-| **G-6: `pytest-httpx` nieużywane** | — | W dev-deps, zero importów w testach | Dług higieniczny |
+| SSE endpoint `/loans/{id}/events` | §4.1: strumieniowe powiadomienia | Lokalny `sse_router` (Etap 4) | **Zrealizowane (Etap 4)** — protokół w notification guide §4.5/§4.8 |
+| Rate limit loans: tylko POST | §8: 3/10 min na POST | Limit na WSZYSTKIE metody `/loans` | Deviation (nadal otwarte!) |
+| Stripe webhook → Disbursement | §4.1: webhook do Disbursement | Proxyje do `loan_service_url` | Deviation (nadal otwarte!) |
+| `/ready` sprawdza Redis | §9.3: readiness = DB/Kafka/Redis | Zawsze 200 | Uproszczenie (nadal otwarte!) |
+| Dockerfile: libs/observability | — | Nie skopiowany | Bug (nadal otwarte!) |
+| `path_prefix` z `{id}` | — | Dosłowny string, nie pattern | Bug (nadal otwarte! — wpisy nie matchują, łapie je longest-prefix `/api/v1/loans`) |
+| Brak Retry-After w 429 | HTTP RFC 7231 | Brak nagłówka | Missing feature (nadal otwarte!) |
+| **G-1: `_match_route` nigdy nie matchuje (wiodący `/`)** | — | Każde żądanie → 404 | **NAPRAWIONE w Etapie 4** (normalizacja + `test_routing_match.py`) |
+| **G-2: documents proxyjowane do złego serwisu** | §4.1: documents → Document | `/api/v1/loans/*` łapie wszystko → loan-application:8002 | **Bug krytyczny (nadal otwarte!)** |
+| **G-3: brak CORS + brak OPTIONS** | §8: CORS tylko origin frontendu | Brak `CORSMiddleware`, brak OPTIONS w methods | **NAPRAWIONE w Etapie 4** (`CORSMiddleware` z credentials + OPTIONS w `allow_methods`) |
+| **G-4: timeout upstream → 500 zamiast 504** | — | Brak `try/except` wokół `forward()` | Bug (nadal otwarte!) |
+| **G-5: `cryptography` niejawną zależnością testów** | — | Import wprost w teście, tylko transitive via `python-jose[cryptography]` | Dług higieniczny (nadal otwarte!) |
+| **G-6: `pytest-httpx` nieużywane** | — | W dev-deps, zero importów w testach | Dług higieniczny (nadal otwarte!) |
+| **G-7 (nowe, Etap 4): prefix-atak na Origin** | §8 | `startswith(frontend_url)` | **Bug (nowy!)** — `http://localhost:3000.evil.com` przechodzi; fix: porównanie `netloc` + test |
+| **G-8 (nowe, Etap 4): osobny `httpx.AsyncClient` na strumień SSE** | — | `_fetch_loan` tworzy klienta per request | **Dług wydajnościowy (nowy!)** — jeden modułowy klient w `init_sse` |
 
 ### 11.2 Szczegółowe opisy luk
 
