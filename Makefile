@@ -34,6 +34,10 @@ test: ## Run test suites across services
 	cd services/applicant && PYTHONPATH=. .venv/bin/pytest tests/unit -q
 	@echo "--- Gateway ---"
 	cd services/gateway && .venv/bin/pytest tests/unit -q
+	@echo "--- Loan Application ---"
+	cd services/loan-application && .venv/bin/pytest tests/unit -q
+	@echo "--- Notification ---"
+	cd services/notification && .venv/bin/pytest tests/unit -q
 
 train-model: ## TODO(Etap 7): train the credit scoring model
 	@echo "Not implemented yet — lands in Etap 7."
